@@ -283,7 +283,14 @@ def content_hash(text):
 
 def load_manifest(output_dir):
     """Returns (seen_urls, seen_hashes). Tolerates the old one-column
-    (URL-only) manifest format from before content-hash dedup existed."""
+    (URL-only) manifest format from before content-hash dedup existed.
+
+    Kept as a plain loader with no filesystem verification -- reconcile_
+    manifest() below is what run_auto/run_url_mode actually call at
+    startup. Left standalone (rather than folded into reconcile_manifest)
+    since it's also useful on its own wherever you just want to read the
+    manifest as written, without triggering a disk walk + rewrite.
+    """
     path = manifest_path(output_dir)
     seen_urls, seen_hashes = set(), set()
     if not os.path.exists(path):
@@ -297,6 +304,70 @@ def load_manifest(output_dir):
             seen_urls.add(parts[0])
             if len(parts) > 1 and parts[1]:
                 seen_hashes.add(parts[1])
+    return seen_urls, seen_hashes
+
+
+def reconcile_manifest(output_dir):
+    """
+    Prunes manifest entries whose backing .txt file no longer exists on
+    disk, and rewrites the manifest to match. Without this, deleting
+    saved articles by hand (or via an external cleanup script) leaves
+    the manifest's memory intact -- the scraper then silently treats
+    those URLs as "already have it" forever, even though nothing is
+    actually on disk to show for it.
+
+    Matches on url_hash (see safe_filename) rather than the manifest's
+    content_hash column: url_hash is deterministically recoverable from
+    the URL alone, whereas confirming content_hash would mean re-reading
+    and re-normalizing every surviving file's text just to compare a
+    hash -- pure overhead over just checking whether a file with that
+    hash exists. A URL counts as still-scraped if EITHER its raw or its
+    lemmatized .txt exists anywhere under output_dir; which language
+    subfolder or raw/lemmatized split it landed in doesn't matter here,
+    only whether a file backing this URL still exists somewhere.
+
+    Called once at the very start of run_auto/run_url_mode, before any
+    scraping begins -- so a run right after a manual cleanup starts from
+    an accurate picture instead of an accurate one only after the next
+    full re-scrape completes.
+    """
+    path = manifest_path(output_dir)
+    if not os.path.exists(path):
+        return set(), set()
+
+    with open(path, "r", encoding="utf-8") as f:
+        lines = [ln.strip() for ln in f if ln.strip()]
+
+    # Walk the output dir once up front -- O(1)-ish membership checks per
+    # manifest line afterward instead of re-globbing per URL.
+    existing_files = []
+    for _root, _dirs, files in os.walk(output_dir):
+        existing_files.extend(name for name in files if name.endswith(".txt"))
+
+    kept_lines, seen_urls, seen_hashes = [], set(), set()
+    pruned = 0
+    for line in lines:
+        parts = line.split("\t")
+        url = parts[0]
+        content_hash_value = parts[1] if len(parts) > 1 and parts[1] else None
+        url_hash = hashlib.sha1(url.encode("utf-8")).hexdigest()[:8]
+        # Matches "..._<hash>.txt" (raw) and "..._<hash>__lemma.txt" alike.
+        still_exists = any(f"__{url_hash}" in fname for fname in existing_files)
+
+        if still_exists:
+            kept_lines.append(line)
+            seen_urls.add(url)
+            if content_hash_value:
+                seen_hashes.add(content_hash_value)
+        else:
+            pruned += 1
+
+    if pruned:
+        with open(path, "w", encoding="utf-8") as f:
+            f.write("\n".join(kept_lines) + ("\n" if kept_lines else ""))
+        print(f"🧹 Manifest reconciled: {pruned} stale entr{'y' if pruned == 1 else 'ies'} "
+              f"removed (backing file no longer on disk).")
+
     return seen_urls, seen_hashes
 
 
@@ -725,7 +796,7 @@ async def scrape_batch(page, urls, output_dir, lemmatize_lang, seen_hashes, dela
 
 async def run_auto(listing_urls, output_dir, lemmatize_lang, delay):
     os.makedirs(output_dir, exist_ok=True)
-    already_urls, seen_hashes = load_manifest(output_dir)
+    already_urls, seen_hashes = reconcile_manifest(output_dir)
 
     if lemmatize_lang:
         ensure_lemmatizer(lemmatize_lang)  # fail fast on a bad language code
@@ -764,7 +835,7 @@ async def run_url_mode(article_urls, output_dir, lemmatize_lang, delay):
     os.makedirs(output_dir, exist_ok=True)
     article_urls = [normalize_url(u) for u in article_urls]
     article_urls = list(dict.fromkeys(article_urls))
-    _, seen_hashes = load_manifest(output_dir)
+    _, seen_hashes = reconcile_manifest(output_dir)
 
     if lemmatize_lang:
         ensure_lemmatizer(lemmatize_lang)  # fail fast on a bad language code
