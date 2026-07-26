@@ -376,28 +376,54 @@ def append_to_manifest(output_dir, url, hash_value):
         f.write(f"{url}\t{hash_value}\n")
 
 
-def clear_manifest(output_dir, skip_confirm=False):
-    """Removes scraped_urls.txt for output_dir. Does NOT touch any saved
-    article .txt files -- only the dedup record of what's already been
-    scraped, so the next run treats everything as new again (URL dedup
-    AND content-hash dedup both reset, since both live in this one file).
+def clear_downloaded_articles(output_dir, skip_confirm=False):
+    """Physically DELETES every saved article .txt file under output_dir
+    -- both the raw/ and lemmatized/ copies, across every per-language
+    subfolder (news_corpus/is/raw/*.txt, news_corpus/en/lemmatized/*.txt,
+    etc). This is the actual downloaded content, not just a dedup record.
+
+    scraped_urls.txt (MANIFEST_NAME) itself is deliberately excluded from
+    the walk/delete below and is instead removed as a separate explicit
+    step at the end: once the backing .txt files are gone, every manifest
+    entry is stale anyway (reconcile_manifest() would otherwise prune them
+    one by one, silently, the next time the script runs), so clearing it
+    here up front avoids leaving a manifest full of dangling references
+    and gives a genuinely clean slate.
 
     skip_confirm=True for scripted/CLI use (--yes); the interactive menu
     always confirms first since this can't be undone."""
-    path = manifest_path(output_dir)
-    if not os.path.exists(path):
-        print(f"   No manifest found at {path} -- nothing to clear.")
+    manifest = manifest_path(output_dir)
+    txt_files = []
+    if os.path.isdir(output_dir):
+        for root, _dirs, files in os.walk(output_dir):
+            for name in files:
+                if not name.endswith(".txt"):
+                    continue
+                full = os.path.join(root, name)
+                if full == manifest:
+                    continue
+                txt_files.append(full)
+
+    manifest_exists = os.path.exists(manifest)
+    if not txt_files and not manifest_exists:
+        print(f"   Nothing found under {output_dir} -- nothing to clear.")
         return
+
     if not skip_confirm and not _prompt_yes_no(
-        f"\nClear {path}? Saved article files are NOT deleted -- this only "
-        f"resets which URLs/content count as 'already scraped', so the "
-        f"next run will re-fetch everything.",
+        f"\nDelete {len(txt_files)} saved article .txt file(s) under {output_dir} "
+        f"(raw + lemmatized) and reset {MANIFEST_NAME}? This permanently deletes "
+        f"the downloaded articles themselves, not just the dedup record.",
         default=False,
     ):
         print("   Cancelled.")
         return
-    os.remove(path)
-    print(f"   ✅ Cleared {path}")
+
+    for f in txt_files:
+        os.remove(f)
+    if manifest_exists:
+        os.remove(manifest)
+    print(f"   ✅ Deleted {len(txt_files)} article file(s)"
+          f"{' and reset ' + MANIFEST_NAME if manifest_exists else ''}")
 
 
 def delete_boilerplate_log(output_dir, skip_confirm=False):
@@ -489,6 +515,56 @@ def detect_language(text):
     return result.iso_code_639_1.name.lower()
 
 
+async def reconcile_language_voices(text, local_lang_code):
+    """Two-voiced language ID: local_lang_code is whatever detect_language()
+    (the lingua voice) already decided; this calls Gemini (the API voice,
+    in language_voices.py) on the SAME text and reconciles the two.
+
+    Three cases, same "don't guess past what the evidence supports"
+    discipline as fetch_captions.py's caption reconciliation on the Welsh
+    project:
+
+      1. API voice has nothing to say (quota exhausted, transient
+         failure, package/key missing) -> fall back to the local voice
+         alone, unchanged. A missing second opinion is not evidence the
+         first opinion is wrong.
+      2. Local voice had nothing to say (UNKNOWN_LANG_FOLDER) -> the API
+         voice decides alone, since there's nothing to disagree WITH.
+         If the API voice also has nothing, stays UNKNOWN_LANG_FOLDER.
+      3. Both voices have an opinion and they MATCH -> use it, nothing
+         to log, two independent detectors agreeing is itself the
+         evidence.
+      4. Both voices have an opinion and they DIFFER -> genuinely
+         ambiguous (code-switched text, a language outside lingua's
+         closed candidate list that it's silently misreading as a close
+         relative, or a bad Gemini call). Rather than silently picking a
+         winner, this is logged to language_disagreements.json for
+         review. The API voice's answer is used for where the file
+         actually gets saved -- it isn't limited to a hardcoded candidate
+         list the way lingua is, so on a genuine split it's the more
+         likely of the two to be right -- but a language that keeps
+         showing up in that log is a signal to add it to
+         _LINGUA_LANGUAGES and re-test, not to just trust the API voice
+         forever.
+
+    Returns (final_lang_code, disagreement_dict_or_None) -- the caller
+    logs the disagreement (it needs the URL, which this function doesn't
+    have) and decides whether to print anything about it.
+    """
+    api_lang_code = await detect_language_llm(text)
+
+    if api_lang_code is None:
+        return local_lang_code, None
+
+    if local_lang_code == UNKNOWN_LANG_FOLDER:
+        return api_lang_code, None
+
+    if local_lang_code == api_lang_code:
+        return local_lang_code, None
+
+    return api_lang_code, {"local": local_lang_code, "api": api_lang_code}
+
+
 # --------------------------------------------------------------------------
 # Extraction
 # --------------------------------------------------------------------------
@@ -522,6 +598,11 @@ from boilerplate_detector import (
     log_boilerplate_candidates,
     get_gemini_client,
     reset_quota_flag,
+)
+from language_voices import (
+    detect_language_llm,
+    reset_language_quota_flag,
+    log_language_disagreement,
 )
 
 # BUGFIX: re.compile("|".join([])) compiles to the EMPTY pattern, which
@@ -846,7 +927,8 @@ async def discover_article_links(page, listing_url):
 # Scrape a single URL (used by both modes)
 # --------------------------------------------------------------------------
 
-async def scrape_one(page, url, output_dir, lemmatize_lang, seen_hashes, index, total, detect_boilerplate=False):
+async def scrape_one(page, url, output_dir, lemmatize_lang, seen_hashes, index, total,
+                      detect_boilerplate=False, detect_language_llm_flag=False):
     try:
         tqdm.write(f"[{index}/{total}] {url}")
         text = await extract_article_text(page, url)
@@ -868,6 +950,16 @@ async def scrape_one(page, url, output_dir, lemmatize_lang, seen_hashes, index, 
         # function words flattened) is a worse detection input than
         # natural running text.
         lang_code = detect_language(text)
+        if detect_language_llm_flag:
+            lang_code, disagreement = await reconcile_language_voices(text, lang_code)
+            if disagreement:
+                logged = log_language_disagreement(
+                    output_dir, url, disagreement["local"], disagreement["api"]
+                )
+                if logged:
+                    tqdm.write(f"   🗣️  Language voices disagreed (lingua='{disagreement['local']}' vs "
+                               f"gemini='{disagreement['api']}') -> filed under '{lang_code}', "
+                               f"logged to language_disagreements.json")
         lang_dir = os.path.join(output_dir, lang_code)
 
         # BUGFIX: this used to lemmatize text IN PLACE and only ever save
@@ -926,13 +1018,15 @@ async def scrape_one(page, url, output_dir, lemmatize_lang, seen_hashes, index, 
         return False
 
 
-async def scrape_batch(page, urls, output_dir, lemmatize_lang, seen_hashes, delay, detect_boilerplate=False):
+async def scrape_batch(page, urls, output_dir, lemmatize_lang, seen_hashes, delay,
+                        detect_boilerplate=False, detect_language_llm_flag=False):
     failed = []
     saved = 0
     with tqdm(total=len(urls), desc="Scraping", unit="article") as pbar:
         for i, url in enumerate(urls):
             ok = await scrape_one(page, url, output_dir, lemmatize_lang, seen_hashes, i + 1, len(urls),
-                                   detect_boilerplate=detect_boilerplate)
+                                   detect_boilerplate=detect_boilerplate,
+                                   detect_language_llm_flag=detect_language_llm_flag)
             if ok:
                 saved += 1
             else:
@@ -948,7 +1042,8 @@ async def scrape_batch(page, urls, output_dir, lemmatize_lang, seen_hashes, dela
         with tqdm(total=len(failed), desc="Retrying", unit="article") as pbar:
             for i, url in enumerate(failed):
                 ok = await scrape_one(page, url, output_dir, lemmatize_lang, seen_hashes, i + 1, len(failed),
-                                       detect_boilerplate=detect_boilerplate)
+                                       detect_boilerplate=detect_boilerplate,
+                                       detect_language_llm_flag=detect_language_llm_flag)
                 if ok:
                     saved += 1
                 else:
@@ -969,16 +1064,21 @@ async def scrape_batch(page, urls, output_dir, lemmatize_lang, seen_hashes, dela
 # Modes
 # --------------------------------------------------------------------------
 
-async def run_auto(listing_urls, output_dir, lemmatize_lang, delay, detect_boilerplate=False):
+async def run_auto(listing_urls, output_dir, lemmatize_lang, delay, detect_boilerplate=False,
+                    detect_language_llm_flag=False):
     os.makedirs(output_dir, exist_ok=True)
     already_urls, seen_hashes = reconcile_manifest(output_dir)
 
     if lemmatize_lang:
         ensure_lemmatizer(lemmatize_lang)  # fail fast on a bad language code
+    if detect_boilerplate or detect_language_llm_flag:
+        get_gemini_client()  # fail fast on missing package/API key -- shared
+                              # by both LLM features, same client either way
     if detect_boilerplate:
-        get_gemini_client()  # fail fast on missing package/API key
         reset_quota_flag()   # a previous run in this same interactive-menu
                               # session shouldn't leave detection disabled here
+    if detect_language_llm_flag:
+        reset_language_quota_flag()  # same reasoning, separate flag
 
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=True)
@@ -1006,12 +1106,14 @@ async def run_auto(listing_urls, output_dir, lemmatize_lang, delay, detect_boile
             return
 
         saved = await scrape_batch(page, new_links, output_dir, lemmatize_lang, seen_hashes, delay,
-                                    detect_boilerplate=detect_boilerplate)
+                                    detect_boilerplate=detect_boilerplate,
+                                    detect_language_llm_flag=detect_language_llm_flag)
         await browser.close()
         print(f"\n🎉 Done! Saved {saved} new articles to {output_dir}/")
 
 
-async def run_url_mode(article_urls, output_dir, lemmatize_lang, delay, detect_boilerplate=False):
+async def run_url_mode(article_urls, output_dir, lemmatize_lang, delay, detect_boilerplate=False,
+                        detect_language_llm_flag=False):
     os.makedirs(output_dir, exist_ok=True)
     article_urls = [normalize_url(u) for u in article_urls]
     article_urls = list(dict.fromkeys(article_urls))
@@ -1019,10 +1121,14 @@ async def run_url_mode(article_urls, output_dir, lemmatize_lang, delay, detect_b
 
     if lemmatize_lang:
         ensure_lemmatizer(lemmatize_lang)  # fail fast on a bad language code
+    if detect_boilerplate or detect_language_llm_flag:
+        get_gemini_client()  # fail fast on missing package/API key -- shared
+                              # by both LLM features, same client either way
     if detect_boilerplate:
-        get_gemini_client()  # fail fast on missing package/API key
         reset_quota_flag()   # a previous run in this same interactive-menu
                               # session shouldn't leave detection disabled here
+    if detect_language_llm_flag:
+        reset_language_quota_flag()  # same reasoning, separate flag
 
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=True)
@@ -1030,7 +1136,8 @@ async def run_url_mode(article_urls, output_dir, lemmatize_lang, delay, detect_b
         page.set_default_timeout(30000)
 
         saved = await scrape_batch(page, article_urls, output_dir, lemmatize_lang, seen_hashes, delay,
-                                    detect_boilerplate=detect_boilerplate)
+                                    detect_boilerplate=detect_boilerplate,
+                                    detect_language_llm_flag=detect_language_llm_flag)
         await browser.close()
         print(f"\n🎉 Done! Saved {saved} article(s) to {output_dir}/")
 
@@ -1041,6 +1148,17 @@ async def run_url_mode(article_urls, output_dir, lemmatize_lang, delay, detect_b
 # argparse path below instead, for scripting/automation)
 # --------------------------------------------------------------------------
 
+class UserQuit(Exception):
+    """Raised by any of the interactive _prompt_* helpers (or the couple
+    of raw input() calls in interactive_menu that don't go through one)
+    the moment the user types 'q' at ANY step of the interactive session
+    -- mode choice, URL entry, yes/no prompts, output-dir, lemmatize lang,
+    all of it. Propagates all the way up to main()'s while-loop, which is
+    the only place it's caught, so quitting from deep inside a nested
+    prompt (e.g. mid confirmation for 'clear') doesn't need every
+    intermediate caller to know how to handle it -- it just unwinds."""
+    pass
+
 def _print_banner():
     print("=" * 60)
     print("  📰  News Article Scraper")
@@ -1048,24 +1166,34 @@ def _print_banner():
 
 
 def _prompt_choice(question, options):
-    """options: list of (key, label) tuples. Returns the chosen key."""
+    """options: list of (key, label) tuples. Returns the chosen key.
+
+    'q' is always accepted here too, on top of whatever's in options --
+    typing it raises UserQuit rather than being treated as an invalid
+    choice, so quitting doesn't need to be an explicit option on every
+    single call site."""
     print(f"\n{question}")
     for key, label in options:
         print(f"  {key}) {label}")
+    print("  q) Quit")
     valid_keys = [k.lower() for k, _ in options]
     while True:
         choice = input("> ").strip().lower()
+        if choice == "q":
+            raise UserQuit
         if choice in valid_keys:
             return choice
-        print(f"   Please enter one of: {', '.join(k for k, _ in options)}")
+        print(f"   Please enter one of: {', '.join(k for k, _ in options)}, q")
 
 
 def _prompt_urls(prompt_text):
     print(f"\n{prompt_text}")
-    print("(paste one or more URLs -- comma-separated, or one per line; blank line when done)")
+    print("(paste one or more URLs -- comma-separated, or one per line; blank line when done, q to quit)")
     urls = []
     while True:
         line = input("> ").strip()
+        if line.lower() == "q":
+            raise UserQuit
         if not line:
             if urls:
                 break
@@ -1078,14 +1206,16 @@ def _prompt_urls(prompt_text):
 def _prompt_yes_no(question, default=False):
     suffix = "Y/n" if default else "y/N"
     while True:
-        ans = input(f"{question} [{suffix}] ").strip().lower()
+        ans = input(f"{question} [{suffix}/q] ").strip().lower()
+        if ans == "q":
+            raise UserQuit
         if not ans:
             return default
         if ans in ("y", "yes"):
             return True
         if ans in ("n", "no"):
             return False
-        print("   Please answer y or n.")
+        print("   Please answer y, n, or q.")
 
 
 def interactive_menu():
@@ -1095,7 +1225,10 @@ def interactive_menu():
     # which output dir's files to act on, and both are reachable from the
     # mode-choice prompt below, so the directory has to be known before
     # that prompt runs, not after.
-    output_dir = input(f"Output directory [{DEFAULT_OUTPUT}]: ").strip() or DEFAULT_OUTPUT
+    output_dir = input(f"Output directory [{DEFAULT_OUTPUT}] (q to quit): ").strip()
+    if output_dir.lower() == "q":
+        raise UserQuit
+    output_dir = output_dir or DEFAULT_OUTPUT
 
     # Loops on 'clear'/'delete' since those are one-off maintenance
     # actions, not a mode to scrape in -- do the action, then show the
@@ -1106,11 +1239,11 @@ def interactive_menu():
             "What would you like to do?",
             [("1", "Auto-discover articles from a listing/section page"),
              ("2", "Scrape specific article URL(s) directly"),
-             ("clear", f"Clear scraped_urls.txt for '{output_dir}' (forces a full re-scrape, keeps saved articles)"),
+             ("clear", f"Delete downloaded article .txt files for '{output_dir}' (raw + lemmatized; resets scraped_urls.txt too)"),
              ("delete", f"Delete boilerplate_candidates.json for '{output_dir}' (the LLM review log)")],
         )
         if mode_key == "clear":
-            clear_manifest(output_dir)
+            clear_downloaded_articles(output_dir)
             continue
         if mode_key == "delete":
             delete_boilerplate_log(output_dir)
@@ -1130,7 +1263,10 @@ def interactive_menu():
     )
     lemmatize_lang = None
     if do_lemmatize:
-        lemmatize_lang = input("   Stanza language code (e.g. is, en, cy): ").strip() or None
+        lemmatize_lang = input("   Stanza language code (e.g. is, en, cy) (q to quit): ").strip()
+        if lemmatize_lang.lower() == "q":
+            raise UserQuit
+        lemmatize_lang = lemmatize_lang or None
 
     detect_boilerplate = _prompt_yes_no(
         "\nUse Gemini's free API tier to flag possible leftover boilerplate for review? "
@@ -1139,15 +1275,24 @@ def interactive_menu():
         default=False,
     )
 
+    detect_language_llm_flag = _prompt_yes_no(
+        "\nGet a second opinion on language ID from Gemini, alongside the built-in "
+        "lingua detector? (one extra API call per article, same free tier/key as "
+        "boilerplate detection above; when the two disagree, Gemini's answer is used "
+        "and the split is logged to language_disagreements.json for review)",
+        default=False,
+    )
+
     print(f"\n{'=' * 60}")
     print(f"  Mode:       {'Auto-discover' if mode == 'auto' else 'Direct URL(s)'}")
     print(f"  URLs:       {len(urls)} given")
     print(f"  Lemmatize:  {lemmatize_lang if lemmatize_lang else 'No'}")
     print(f"  Detect boilerplate (LLM): {'Yes' if detect_boilerplate else 'No'}")
+    print(f"  Language ID second voice (LLM): {'Yes' if detect_language_llm_flag else 'No'}")
     print(f"  Output dir: {output_dir}")
     print(f"{'=' * 60}\n")
 
-    return mode, urls, output_dir, lemmatize_lang, detect_boilerplate
+    return mode, urls, output_dir, lemmatize_lang, detect_boilerplate, detect_language_llm_flag
 
 
 # --------------------------------------------------------------------------
@@ -1165,17 +1310,31 @@ def main():
         # interactive session -- meant doing a second run required
         # relaunching the script from scratch. Now loops back to the menu
         # after each run and asks whether to go again, until you say no.
-        while True:
-            mode, urls, output_dir, lemmatize_lang, detect_boilerplate = interactive_menu()
-            if mode == "auto":
-                asyncio.run(run_auto(urls, output_dir, lemmatize_lang, delay,
-                                      detect_boilerplate=detect_boilerplate))
-            else:
-                asyncio.run(run_url_mode(urls, output_dir, lemmatize_lang, delay,
-                                          detect_boilerplate=detect_boilerplate))
-            if not _prompt_yes_no("\nBack to the main menu for another run?", default=True):
-                print("\n👋 Bye!")
-                break
+        # UserQuit can be raised from literally any prompt inside
+        # interactive_menu() -- mode choice, URL entry, output-dir,
+        # lemmatize lang, the clear/delete confirmations, the
+        # detect-boilerplate yes/no, all of it -- since every one of
+        # those prompts now accepts 'q'. Catching it once here, around
+        # the whole loop, means none of the intermediate functions need
+        # their own try/except; typing 'q' anywhere just unwinds straight
+        # to this one exit point.
+        try:
+            while True:
+                (mode, urls, output_dir, lemmatize_lang, detect_boilerplate,
+                 detect_language_llm_flag) = interactive_menu()
+                if mode == "auto":
+                    asyncio.run(run_auto(urls, output_dir, lemmatize_lang, delay,
+                                          detect_boilerplate=detect_boilerplate,
+                                          detect_language_llm_flag=detect_language_llm_flag))
+                else:
+                    asyncio.run(run_url_mode(urls, output_dir, lemmatize_lang, delay,
+                                              detect_boilerplate=detect_boilerplate,
+                                              detect_language_llm_flag=detect_language_llm_flag))
+                if not _prompt_yes_no("\nBack to the main menu for another run?", default=True):
+                    print("\n👋 Bye!")
+                    break
+        except UserQuit:
+            print("\n👋 Bye!")
         return
 
     parser = argparse.ArgumentParser(description="Generic news article scraper")
@@ -1190,6 +1349,10 @@ def main():
                          help="Use Gemini's free API tier to flag possible leftover boilerplate per article for review "
                               "(logs candidates to boilerplate_candidates.json, never auto-applied; "
                               "requires GEMINI_API_KEY)")
+    auto_p.add_argument("--detect-language-llm", action="store_true",
+                         help="Get a second language-ID opinion from Gemini alongside the built-in lingua "
+                              "detector (same free tier/key as --detect-boilerplate); on disagreement, "
+                              "Gemini's answer is used and the split is logged to language_disagreements.json")
 
     url_p = sub.add_parser("url", help="Scrape one or more specific article URLs directly")
     url_p.add_argument("urls", nargs="+", help="One or more direct article URLs")
@@ -1200,8 +1363,12 @@ def main():
                         help="Use Gemini's free API tier to flag possible leftover boilerplate per article for review "
                              "(logs candidates to boilerplate_candidates.json, never auto-applied; "
                              "requires GEMINI_API_KEY)")
+    url_p.add_argument("--detect-language-llm", action="store_true",
+                        help="Get a second language-ID opinion from Gemini alongside the built-in lingua "
+                             "detector (same free tier/key as --detect-boilerplate); on disagreement, "
+                             "Gemini's answer is used and the split is logged to language_disagreements.json")
 
-    clear_p = sub.add_parser("clear", help="Clear scraped_urls.txt (forces a full re-scrape; does NOT delete saved article files)")
+    clear_p = sub.add_parser("clear", help="Delete downloaded article .txt files (raw + lemmatized) and reset scraped_urls.txt")
     clear_p.add_argument("--output-dir", default=DEFAULT_OUTPUT)
     clear_p.add_argument("--yes", action="store_true", help="Skip the confirmation prompt")
 
@@ -1213,12 +1380,14 @@ def main():
 
     if args.mode == "auto":
         asyncio.run(run_auto(args.urls, args.output_dir, args.lemmatize, args.delay,
-                              detect_boilerplate=args.detect_boilerplate))
+                              detect_boilerplate=args.detect_boilerplate,
+                              detect_language_llm_flag=args.detect_language_llm))
     elif args.mode == "url":
         asyncio.run(run_url_mode(args.urls, args.output_dir, args.lemmatize, args.delay,
-                                  detect_boilerplate=args.detect_boilerplate))
+                                  detect_boilerplate=args.detect_boilerplate,
+                                  detect_language_llm_flag=args.detect_language_llm))
     elif args.mode == "clear":
-        clear_manifest(args.output_dir, skip_confirm=args.yes)
+        clear_downloaded_articles(args.output_dir, skip_confirm=args.yes)
     elif args.mode == "delete":
         delete_boilerplate_log(args.output_dir, skip_confirm=args.yes)
 
