@@ -10,12 +10,12 @@ Two modes:
                      It crawls the page, discovers likely article
                      links automatically, and scrapes all new ones.
 
-      python news_scraper.py auto https://example.com/news https://example.com/sport
+      python icelandic_text_extractor.py auto https://example.com/news https://example.com/sport
 
   Mode 2 - "url":   give it one or more specific ARTICLE URLs directly.
                      It scrapes exactly those, no discovery step.
 
-      python news_scraper.py url https://example.com/news/some-headline-slug
+      python icelandic_text_extractor.py url https://example.com/news/some-headline-slug
 
 Common options:
   --output-dir DIR       where .txt files + manifest go (default ./news_corpus).
@@ -376,6 +376,54 @@ def append_to_manifest(output_dir, url, hash_value):
         f.write(f"{url}\t{hash_value}\n")
 
 
+def clear_manifest(output_dir, skip_confirm=False):
+    """Removes scraped_urls.txt for output_dir. Does NOT touch any saved
+    article .txt files -- only the dedup record of what's already been
+    scraped, so the next run treats everything as new again (URL dedup
+    AND content-hash dedup both reset, since both live in this one file).
+
+    skip_confirm=True for scripted/CLI use (--yes); the interactive menu
+    always confirms first since this can't be undone."""
+    path = manifest_path(output_dir)
+    if not os.path.exists(path):
+        print(f"   No manifest found at {path} -- nothing to clear.")
+        return
+    if not skip_confirm and not _prompt_yes_no(
+        f"\nClear {path}? Saved article files are NOT deleted -- this only "
+        f"resets which URLs/content count as 'already scraped', so the "
+        f"next run will re-fetch everything.",
+        default=False,
+    ):
+        print("   Cancelled.")
+        return
+    os.remove(path)
+    print(f"   ✅ Cleared {path}")
+
+
+def delete_boilerplate_log(output_dir, skip_confirm=False):
+    """Deletes boilerplate_candidates.json for output_dir -- the LLM
+    review-queue log from boilerplate_detector.py, not the actual
+    boilerplate_patterns.py filter tables. Permanent: make sure any real
+    hits have already been promoted into boilerplate_patterns.py by hand
+    before clearing this, since nothing here reads it back out.
+
+    skip_confirm=True for scripted/CLI use (--yes); the interactive menu
+    always confirms first since this can't be undone."""
+    path = os.path.join(output_dir, "boilerplate_candidates.json")
+    if not os.path.exists(path):
+        print(f"   No boilerplate_candidates.json found at {path} -- nothing to delete.")
+        return
+    if not skip_confirm and not _prompt_yes_no(
+        f"\nDelete {path}? Make sure you've reviewed and promoted any real "
+        f"patterns into boilerplate_patterns.py first -- this is permanent.",
+        default=False,
+    ):
+        print("   Cancelled.")
+        return
+    os.remove(path)
+    print(f"   ✅ Deleted {path}")
+
+
 # --------------------------------------------------------------------------
 # Lemmatization (optional, lazy)
 # --------------------------------------------------------------------------
@@ -457,34 +505,125 @@ ARTICLE_CONTAINER_SELECTORS = [
     "main", "[role='main']",
 ]
 
-# Generic boilerplate signals for the page-wide <p> last-resort path.
-# Deliberately broad/domain-agnostic (phone numbers, postal-style
-# addresses, copyright lines, common contact-block labels in Icelandic
-# and English) rather than RUV-specific strings, since the same fallback
-# runs against whatever site auto/url mode is pointed at.
-BOILERPLATE_PATTERNS = [
-    r"s[ií]mi\s*[:.]?\s*\d",          # "Sími: 515-3000"
-    r"\bnetfang\s*[:.]?",              # "Netfang:"
-    r"\bkt\.?\s*\d{6}-?\d{4}\b",       # Icelandic kennitala
-    r"\b\d{3}[-\s]\d{4}\b",            # bare phone number pattern
-    r"^\S+\s+\d+,\s*\d{3}\s+\S+$",     # "Efstaleiti 1, 103 Reykjavík" -- street, postcode, place
-    r"^©", r"\ball rights reserved\b",
-    r"^\s*(privacy policy|terms of (use|service))\s*$",
-    # Cookie-consent placeholder shown in place of a blocked third-party
-    # embed (RUV, confirmed from a real scraped article: appeared 3x
-    # verbatim in one piece, once per blocked embed -- since it's UI
-    # chrome rendered as <p> tags INSIDE the article body container, it
-    # survives container-scoping and needs a text-content check instead).
-    r"innfellt efni frá annarri vefsíðu",
-    r"vafrakök\w*",
-    r"^viltu samt sjá\??$",   # standalone consent-box follow-up, confirmed
-                              # appearing as its own <p> alongside the above
-]
-_BOILERPLATE_RE = re.compile("|".join(BOILERPLATE_PATTERNS), re.IGNORECASE)
+# Generic boilerplate/junk-text tables (BOILERPLATE_PATTERNS,
+# END_OF_ARTICLE_MARKERS, READ_MORE_SUFFIXES) live in boilerplate_patterns.py
+# now, not inline here -- that list is expected to keep growing as new
+# sites get scraped, and keeping it as pure data in its own file (same
+# split as mutation_tables.py on the Welsh project) means adding a new
+# pattern is a one-line edit there instead of hunting through extraction
+# logic to find where to drop it in.
+from boilerplate_patterns import (
+    BOILERPLATE_PATTERNS,
+    END_OF_ARTICLE_MARKERS,
+    READ_MORE_SUFFIXES,
+)
+from boilerplate_detector import (
+    detect_boilerplate_candidates,
+    log_boilerplate_candidates,
+    get_gemini_client,
+    reset_quota_flag,
+)
+
+# BUGFIX: re.compile("|".join([])) compiles to the EMPTY pattern, which
+# matches at every position in every string -- so if any of these three
+# tables ever gets emptied out (a pattern list that's *expected* to keep
+# growing is also a list someone could accidentally empty during a
+# refactor, or comment out the last entry of), _BOILERPLATE_RE/
+# _END_OF_ARTICLE_RE would start silently classifying EVERY paragraph on
+# EVERY article as boilerplate/an end-marker, rather than matching
+# nothing -- a silent total-data-loss failure mode, not a no-op. Guard by
+# falling back to a pattern that can never match instead of compiling an
+# empty alternation.
+_NEVER_MATCHES = r"(?!x)x"
+
+
+def _compile_alternation(patterns):
+    return re.compile("|".join(patterns) if patterns else _NEVER_MATCHES, re.IGNORECASE)
+
+
+_END_OF_ARTICLE_RE = _compile_alternation(END_OF_ARTICLE_MARKERS)
+_BOILERPLATE_RE = _compile_alternation(BOILERPLATE_PATTERNS)
+_READ_MORE_RE = re.compile(
+    r"\s*(?:" + "|".join(re.escape(s) for s in READ_MORE_SUFFIXES) + r")\s*$"
+    if READ_MORE_SUFFIXES else _NEVER_MATCHES,
+    re.IGNORECASE,
+)
+
+
+def truncate_at_end_markers(paragraphs):
+    """Drops an END_OF_ARTICLE_MARKERS paragraph and everything after it.
+
+    BUGFIX: this alone isn't enough when the related-content section sits
+    BEFORE the footer instead of after it -- confirmed on a real SVT.se
+    article, where a carousel title ("Framsteg runt om i världen") landed
+    immediately before the "Så arbetar vi" marker rather than after, and
+    survived as a trailing fragment in the saved article. Handled by
+    strip_trailing_header_fragment() below, applied right after this.
+    """
+    for i, p in enumerate(paragraphs):
+        if _END_OF_ARTICLE_RE.search(p.strip()):
+            return paragraphs[:i]
+    return paragraphs
+
+
+_SENTENCE_END_CHARS = ".!?…”\"'"
+
+
+def strip_trailing_header_fragment(paragraphs):
+    """Trims bare heading-like paragraphs off the END of the list -- short
+    (<=60 chars) and not ending in normal sentence-closing punctuation.
+    Real prose almost always ends with one; a related-content carousel
+    title like "Framsteg runt om i världen" (SVT.se, confirmed) doesn't.
+
+    Only ever trims from the tail, and never trims the list down to
+    nothing, so this can't eat real content -- worst case a short,
+    unpunctuated final sentence stays untouched because trimming would
+    have emptied the list.
+    """
+    result = list(paragraphs)
+    while len(result) > 1:
+        last = result[-1].strip()
+        if last and len(last) <= 60 and last[-1] not in _SENTENCE_END_CHARS:
+            result.pop()
+        else:
+            break
+    return result
 
 
 def looks_like_boilerplate(paragraph_text):
     return bool(_BOILERPLATE_RE.search(paragraph_text.strip()))
+
+
+def dedupe_consecutive_paragraphs(paragraphs):
+    """Drops back-to-back duplicate paragraphs and collapses truncated-
+    teaser + full-text pairs from read-more widgets into just the full
+    version. Two known real cases this fixes:
+
+    1. A byline/credit block appearing twice in a row verbatim (confirmed
+       on a NOS.nl article: "correspondent Israël en Palestijnse Gebieden"
+       extracted as two separate identical paragraphs).
+    2. DR.dk "vis mere" teaser widgets: the short version ending in "vis
+       mere" is immediately followed by the same text again in full. Kept
+       version is the fuller one (without the trailing "vis mere"), since
+       that's the actual content -- the truncated copy is UI chrome, not
+       a second sentence.
+
+    Only compares immediate neighbors (not a corpus-wide dedup) since the
+    duplication this targets is always adjacent in the DOM.
+    """
+    cleaned = []
+    for p in paragraphs:
+        p_stripped = p.strip()
+        if cleaned:
+            prev = cleaned[-1].strip()
+            if p_stripped == prev:
+                continue  # exact consecutive duplicate, drop the repeat
+            prev_no_suffix = _READ_MORE_RE.sub("", prev).strip()
+            if prev_no_suffix and prev_no_suffix == p_stripped:
+                cleaned[-1] = p  # replace the truncated teaser with the full text
+                continue
+        cleaned.append(p)
+    return cleaned
 
 
 async def extract_via_override(page, override):
@@ -531,6 +670,9 @@ async def extract_via_override(page, override):
         return None
     if not texts:
         return None
+    texts = truncate_at_end_markers(texts)
+    texts = strip_trailing_header_fragment(texts)
+    texts = dedupe_consecutive_paragraphs(texts)
     texts = [t for t in texts if not looks_like_boilerplate(t)]
     if not texts:
         return None
@@ -621,7 +763,11 @@ async def extract_article_text(page, url):
         # ones). Split on paragraph breaks, drop any matching paragraph,
         # rejoin -- same check extract_via_override() and the page-wide
         # fallback below both use, kept in sync across all three paths.
-        cleaned_paragraphs = [p for p in text.strip().split("\n\n")
+        raw_paragraphs = text.strip().split("\n\n")
+        truncated_paragraphs = truncate_at_end_markers(raw_paragraphs)
+        truncated_paragraphs = strip_trailing_header_fragment(truncated_paragraphs)
+        deduped_paragraphs = dedupe_consecutive_paragraphs(truncated_paragraphs)
+        cleaned_paragraphs = [p for p in deduped_paragraphs
                               if not looks_like_boilerplate(p)]
         cleaned = "\n\n".join(cleaned_paragraphs).strip()
         if cleaned:
@@ -635,31 +781,42 @@ async def extract_article_text(page, url):
     # RUV's address/phone footer block ending up saved as article text).
     # Now tries known article-container selectors first -- if the page
     # has one, only <p>s inside it are ever considered, so boilerplate
-    # outside the container is structurally excluded, not just filtered.
-    # Only falls through to page-wide <p> if no container matches, and
-    # even then, filters against looks_like_boilerplate() as a second
-    # line of defense.
+    # living OUTSIDE the container is structurally excluded, not just
+    # filtered. looks_like_boilerplate() still runs on every paragraph
+    # regardless of whether a container matched, though (see the BUGFIX
+    # below it) -- a matched container is not a guarantee against
+    # boilerplate living INSIDE it.
     paragraphs = []
-    used_container = False
     for selector in ARTICLE_CONTAINER_SELECTORS:
         container = await page.query_selector(selector)
         if container:
             paragraphs = await container.query_selector_all("p")
             if paragraphs:
-                used_container = True
                 break
 
     if not paragraphs:
         paragraphs = await page.query_selector_all("p")
 
+    # BUGFIX: this used to only run looks_like_boilerplate() when no
+    # container matched, on the assumption that a matched container
+    # (article/.article-body/etc.) can't contain boilerplate paragraphs.
+    # extract_via_override() above disproves that for this exact code-
+    # base: the RUV cookie-consent-for-blocked-embed placeholder rendered
+    # as its own <p> INSIDE .article-body, not outside it, which is why
+    # that function needed this same text-content check applied even
+    # after container-scoping. This fallback had the identical blind spot
+    # -- run the check unconditionally now, same as every other path.
     texts = []
     for p in paragraphs:
         t = (await p.inner_text()).strip()
         if len(t) < 40:
             continue
-        if not used_container and looks_like_boilerplate(t):
+        if looks_like_boilerplate(t):
             continue
         texts.append(t)
+    texts = truncate_at_end_markers(texts)
+    texts = strip_trailing_header_fragment(texts)
+    texts = dedupe_consecutive_paragraphs(texts)
     fallback_text = "\n\n".join(texts)
     return fallback_text.strip() if fallback_text.strip() else None
 
@@ -689,7 +846,7 @@ async def discover_article_links(page, listing_url):
 # Scrape a single URL (used by both modes)
 # --------------------------------------------------------------------------
 
-async def scrape_one(page, url, output_dir, lemmatize_lang, seen_hashes, index, total):
+async def scrape_one(page, url, output_dir, lemmatize_lang, seen_hashes, index, total, detect_boilerplate=False):
     try:
         tqdm.write(f"[{index}/{total}] {url}")
         text = await extract_article_text(page, url)
@@ -743,6 +900,22 @@ async def scrape_one(page, url, output_dir, lemmatize_lang, seen_hashes, index, 
                 f.write(lemma_text)
             saved_note += f"  +  {lang_code}/lemmatized/{lemma_filename}"
 
+        # Optional LLM pass over the just-saved text, looking for
+        # boilerplate that slipped past BOILERPLATE_PATTERNS /
+        # END_OF_ARTICLE_MARKERS. This never touches what got saved above
+        # -- it only logs candidates to boilerplate_candidates.json for
+        # you to review and promote into boilerplate_patterns.py by hand,
+        # same role lemma_cache.json plays on the Welsh project (a
+        # persistent record building up across runs), except this one is
+        # a review queue rather than a reusable cache: entries don't get
+        # consumed, they sit there until you've looked at them.
+        if detect_boilerplate:
+            candidates = await detect_boilerplate_candidates(text)
+            added = log_boilerplate_candidates(output_dir, url, candidates)
+            if added:
+                tqdm.write(f"   🔍 LLM flagged {added} possible boilerplate fragment(s) "
+                           f"→ boilerplate_candidates.json")
+
         seen_hashes.add(raw_hash)
         append_to_manifest(output_dir, normalize_url(url), raw_hash)
         tqdm.write(f"   ✅ Saved: {saved_note}")
@@ -753,12 +926,13 @@ async def scrape_one(page, url, output_dir, lemmatize_lang, seen_hashes, index, 
         return False
 
 
-async def scrape_batch(page, urls, output_dir, lemmatize_lang, seen_hashes, delay):
+async def scrape_batch(page, urls, output_dir, lemmatize_lang, seen_hashes, delay, detect_boilerplate=False):
     failed = []
     saved = 0
     with tqdm(total=len(urls), desc="Scraping", unit="article") as pbar:
         for i, url in enumerate(urls):
-            ok = await scrape_one(page, url, output_dir, lemmatize_lang, seen_hashes, i + 1, len(urls))
+            ok = await scrape_one(page, url, output_dir, lemmatize_lang, seen_hashes, i + 1, len(urls),
+                                   detect_boilerplate=detect_boilerplate)
             if ok:
                 saved += 1
             else:
@@ -773,7 +947,8 @@ async def scrape_batch(page, urls, output_dir, lemmatize_lang, seen_hashes, dela
         still_failed = []
         with tqdm(total=len(failed), desc="Retrying", unit="article") as pbar:
             for i, url in enumerate(failed):
-                ok = await scrape_one(page, url, output_dir, lemmatize_lang, seen_hashes, i + 1, len(failed))
+                ok = await scrape_one(page, url, output_dir, lemmatize_lang, seen_hashes, i + 1, len(failed),
+                                       detect_boilerplate=detect_boilerplate)
                 if ok:
                     saved += 1
                 else:
@@ -794,12 +969,16 @@ async def scrape_batch(page, urls, output_dir, lemmatize_lang, seen_hashes, dela
 # Modes
 # --------------------------------------------------------------------------
 
-async def run_auto(listing_urls, output_dir, lemmatize_lang, delay):
+async def run_auto(listing_urls, output_dir, lemmatize_lang, delay, detect_boilerplate=False):
     os.makedirs(output_dir, exist_ok=True)
     already_urls, seen_hashes = reconcile_manifest(output_dir)
 
     if lemmatize_lang:
         ensure_lemmatizer(lemmatize_lang)  # fail fast on a bad language code
+    if detect_boilerplate:
+        get_gemini_client()  # fail fast on missing package/API key
+        reset_quota_flag()   # a previous run in this same interactive-menu
+                              # session shouldn't leave detection disabled here
 
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=True)
@@ -826,12 +1005,13 @@ async def run_auto(listing_urls, output_dir, lemmatize_lang, delay):
             await browser.close()
             return
 
-        saved = await scrape_batch(page, new_links, output_dir, lemmatize_lang, seen_hashes, delay)
+        saved = await scrape_batch(page, new_links, output_dir, lemmatize_lang, seen_hashes, delay,
+                                    detect_boilerplate=detect_boilerplate)
         await browser.close()
         print(f"\n🎉 Done! Saved {saved} new articles to {output_dir}/")
 
 
-async def run_url_mode(article_urls, output_dir, lemmatize_lang, delay):
+async def run_url_mode(article_urls, output_dir, lemmatize_lang, delay, detect_boilerplate=False):
     os.makedirs(output_dir, exist_ok=True)
     article_urls = [normalize_url(u) for u in article_urls]
     article_urls = list(dict.fromkeys(article_urls))
@@ -839,13 +1019,18 @@ async def run_url_mode(article_urls, output_dir, lemmatize_lang, delay):
 
     if lemmatize_lang:
         ensure_lemmatizer(lemmatize_lang)  # fail fast on a bad language code
+    if detect_boilerplate:
+        get_gemini_client()  # fail fast on missing package/API key
+        reset_quota_flag()   # a previous run in this same interactive-menu
+                              # session shouldn't leave detection disabled here
 
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=True)
         page = await browser.new_page()
         page.set_default_timeout(30000)
 
-        saved = await scrape_batch(page, article_urls, output_dir, lemmatize_lang, seen_hashes, delay)
+        saved = await scrape_batch(page, article_urls, output_dir, lemmatize_lang, seen_hashes, delay,
+                                    detect_boilerplate=detect_boilerplate)
         await browser.close()
         print(f"\n🎉 Done! Saved {saved} article(s) to {output_dir}/")
 
@@ -906,11 +1091,32 @@ def _prompt_yes_no(question, default=False):
 def interactive_menu():
     _print_banner()
 
-    mode_key = _prompt_choice(
-        "What would you like to do?",
-        [("1", "Auto-discover articles from a listing/section page"),
-         ("2", "Scrape specific article URL(s) directly")],
-    )
+    # Asked FIRST now (used to be asked last) -- clear/delete need to know
+    # which output dir's files to act on, and both are reachable from the
+    # mode-choice prompt below, so the directory has to be known before
+    # that prompt runs, not after.
+    output_dir = input(f"Output directory [{DEFAULT_OUTPUT}]: ").strip() or DEFAULT_OUTPUT
+
+    # Loops on 'clear'/'delete' since those are one-off maintenance
+    # actions, not a mode to scrape in -- do the action, then show the
+    # choice again instead of falling through into the URL/lemmatize/
+    # detect-boilerplate prompts below.
+    while True:
+        mode_key = _prompt_choice(
+            "What would you like to do?",
+            [("1", "Auto-discover articles from a listing/section page"),
+             ("2", "Scrape specific article URL(s) directly"),
+             ("clear", f"Clear scraped_urls.txt for '{output_dir}' (forces a full re-scrape, keeps saved articles)"),
+             ("delete", f"Delete boilerplate_candidates.json for '{output_dir}' (the LLM review log)")],
+        )
+        if mode_key == "clear":
+            clear_manifest(output_dir)
+            continue
+        if mode_key == "delete":
+            delete_boilerplate_log(output_dir)
+            continue
+        break
+
     mode = "auto" if mode_key == "1" else "url"
 
     urls = _prompt_urls(
@@ -926,16 +1132,22 @@ def interactive_menu():
     if do_lemmatize:
         lemmatize_lang = input("   Stanza language code (e.g. is, en, cy): ").strip() or None
 
-    output_dir = input(f"\nOutput directory [{DEFAULT_OUTPUT}]: ").strip() or DEFAULT_OUTPUT
+    detect_boilerplate = _prompt_yes_no(
+        "\nUse Gemini's free API tier to flag possible leftover boilerplate for review? "
+        "(one API call per saved article, rate-limited on the free tier, "
+        "requires GEMINI_API_KEY; candidates are only logged, never auto-applied)",
+        default=False,
+    )
 
     print(f"\n{'=' * 60}")
     print(f"  Mode:       {'Auto-discover' if mode == 'auto' else 'Direct URL(s)'}")
     print(f"  URLs:       {len(urls)} given")
     print(f"  Lemmatize:  {lemmatize_lang if lemmatize_lang else 'No'}")
+    print(f"  Detect boilerplate (LLM): {'Yes' if detect_boilerplate else 'No'}")
     print(f"  Output dir: {output_dir}")
     print(f"{'=' * 60}\n")
 
-    return mode, urls, output_dir, lemmatize_lang
+    return mode, urls, output_dir, lemmatize_lang, detect_boilerplate
 
 
 # --------------------------------------------------------------------------
@@ -947,12 +1159,23 @@ def main():
     # path below, unchanged, so scripted/automated calls keep working
     # exactly as before.
     if len(sys.argv) == 1:
-        mode, urls, output_dir, lemmatize_lang = interactive_menu()
         delay = 1.5
-        if mode == "auto":
-            asyncio.run(run_auto(urls, output_dir, lemmatize_lang, delay))
-        else:
-            asyncio.run(run_url_mode(urls, output_dir, lemmatize_lang, delay))
+        # BUGFIX: this used to run interactive_menu() once and exit after
+        # the scrape finished, even though it's presented as an
+        # interactive session -- meant doing a second run required
+        # relaunching the script from scratch. Now loops back to the menu
+        # after each run and asks whether to go again, until you say no.
+        while True:
+            mode, urls, output_dir, lemmatize_lang, detect_boilerplate = interactive_menu()
+            if mode == "auto":
+                asyncio.run(run_auto(urls, output_dir, lemmatize_lang, delay,
+                                      detect_boilerplate=detect_boilerplate))
+            else:
+                asyncio.run(run_url_mode(urls, output_dir, lemmatize_lang, delay,
+                                          detect_boilerplate=detect_boilerplate))
+            if not _prompt_yes_no("\nBack to the main menu for another run?", default=True):
+                print("\n👋 Bye!")
+                break
         return
 
     parser = argparse.ArgumentParser(description="Generic news article scraper")
@@ -963,19 +1186,41 @@ def main():
     auto_p.add_argument("--output-dir", default=DEFAULT_OUTPUT)
     auto_p.add_argument("--lemmatize", default=None, help="Stanza language code, e.g. en, cy, is")
     auto_p.add_argument("--delay", type=float, default=1.5, help="Seconds to wait between requests (politeness/rate-limit avoidance, default 1.5)")
+    auto_p.add_argument("--detect-boilerplate", action="store_true",
+                         help="Use Gemini's free API tier to flag possible leftover boilerplate per article for review "
+                              "(logs candidates to boilerplate_candidates.json, never auto-applied; "
+                              "requires GEMINI_API_KEY)")
 
     url_p = sub.add_parser("url", help="Scrape one or more specific article URLs directly")
     url_p.add_argument("urls", nargs="+", help="One or more direct article URLs")
     url_p.add_argument("--output-dir", default=DEFAULT_OUTPUT)
     url_p.add_argument("--lemmatize", default=None, help="Stanza language code, e.g. en, cy, is")
     url_p.add_argument("--delay", type=float, default=1.5, help="Seconds to wait between requests (politeness/rate-limit avoidance, default 1.5)")
+    url_p.add_argument("--detect-boilerplate", action="store_true",
+                        help="Use Gemini's free API tier to flag possible leftover boilerplate per article for review "
+                             "(logs candidates to boilerplate_candidates.json, never auto-applied; "
+                             "requires GEMINI_API_KEY)")
+
+    clear_p = sub.add_parser("clear", help="Clear scraped_urls.txt (forces a full re-scrape; does NOT delete saved article files)")
+    clear_p.add_argument("--output-dir", default=DEFAULT_OUTPUT)
+    clear_p.add_argument("--yes", action="store_true", help="Skip the confirmation prompt")
+
+    delete_p = sub.add_parser("delete", help="Delete boilerplate_candidates.json (the LLM review-queue log)")
+    delete_p.add_argument("--output-dir", default=DEFAULT_OUTPUT)
+    delete_p.add_argument("--yes", action="store_true", help="Skip the confirmation prompt")
 
     args = parser.parse_args()
 
     if args.mode == "auto":
-        asyncio.run(run_auto(args.urls, args.output_dir, args.lemmatize, args.delay))
+        asyncio.run(run_auto(args.urls, args.output_dir, args.lemmatize, args.delay,
+                              detect_boilerplate=args.detect_boilerplate))
     elif args.mode == "url":
-        asyncio.run(run_url_mode(args.urls, args.output_dir, args.lemmatize, args.delay))
+        asyncio.run(run_url_mode(args.urls, args.output_dir, args.lemmatize, args.delay,
+                                  detect_boilerplate=args.detect_boilerplate))
+    elif args.mode == "clear":
+        clear_manifest(args.output_dir, skip_confirm=args.yes)
+    elif args.mode == "delete":
+        delete_boilerplate_log(args.output_dir, skip_confirm=args.yes)
 
 
 if __name__ == "__main__":
