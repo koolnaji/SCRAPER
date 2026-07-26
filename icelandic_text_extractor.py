@@ -25,11 +25,19 @@ Common options:
                           text -- not from which site/URL it came from, so a
                           mixed-language listing page sorts itself correctly.
                           Undetectable/ambiguous text lands in news_corpus/unknown/.
+                          Within each language folder, the raw extracted text
+                          always goes in raw/ -- and if --lemmatize is given,
+                          a SEPARATE lemmatized copy is additionally saved in
+                          lemmatized/, filename suffixed '__lemma', so both
+                          variants of the same article coexist rather than
+                          the lemmatized one replacing the raw one.
                           The scraped_urls.txt manifest itself stays at the
                           top level, shared across all languages, since dedup
                           is corpus-wide.
-  --lemmatize LANG_CODE  optional Stanza lemmatization, e.g. --lemmatize en
-                          (leave off to just save raw extracted text).
+  --lemmatize LANG_CODE  optional Stanza lemmatization, e.g. --lemmatize en --
+                          ADDS a lemmatized copy alongside the raw one (see
+                          above), it doesn't replace it. Leave off to only
+                          save raw text.
                           Language detection for folder routing always runs
                           on the RAW text first, regardless of this flag.
   --delay SECONDS         pause between requests, default 1.5s (+jitter)
@@ -207,13 +215,18 @@ def normalize_url(url):
     return f"{parsed.scheme}://{parsed.netloc}{path}"
 
 
-def safe_filename(url, max_len=80):
+def safe_filename(url, variant=None, max_len=80):
+    """variant, if given, is appended before the extension (e.g. 'lemma')
+    so the raw and lemmatized copies of the same article get distinct
+    filenames sharing the same domain/slug/hash prefix -- easy to spot
+    as a pair, impossible to silently overwrite one another."""
     parsed = urlparse(url)
     domain = parsed.netloc.replace("www.", "")
     slug = parsed.path.rstrip("/").split("/")[-1] or "index"
     slug = re.sub(r"[^a-zA-Z0-9\-_]", "_", slug)[:max_len]
     url_hash = hashlib.sha1(url.encode("utf-8")).hexdigest()[:8]
-    return f"{domain}__{slug}__{url_hash}.txt"
+    suffix = f"__{variant}" if variant else ""
+    return f"{domain}__{slug}__{url_hash}{suffix}.txt"
 
 
 def looks_like_article(url, base_domain):
@@ -627,21 +640,41 @@ async def scrape_one(page, url, output_dir, lemmatize_lang, seen_hashes, index, 
         # function words flattened) is a worse detection input than
         # natural running text.
         lang_code = detect_language(text)
+        lang_dir = os.path.join(output_dir, lang_code)
+
+        # BUGFIX: this used to lemmatize text IN PLACE and only ever save
+        # one variant -- meaning scraping a URL raw, then later re-running
+        # the same URL with --lemmatize, just got skipped as a duplicate
+        # (dedup is by URL/content-hash, computed before lemmatization),
+        # so there was no way to actually end up with both versions of
+        # the same article side by side. Now: the raw text is always
+        # saved first, and a lemmatized copy is saved ADDITIONALLY (same
+        # single extraction, no re-scraping) when --lemmatize is given --
+        # raw/ and lemmatized/ subfolders under each language, with the
+        # lemmatized filename carrying a '__lemma' suffix so the two
+        # never collide and are easy to spot as a matched pair.
+        raw_dir = os.path.join(lang_dir, "raw")
+        os.makedirs(raw_dir, exist_ok=True)
+        raw_filename = safe_filename(url)
+        raw_filepath = os.path.join(raw_dir, raw_filename)
+        with open(raw_filepath, "w", encoding="utf-8") as f:
+            f.write(text)
+        saved_note = f"{lang_code}/raw/{raw_filename}"
 
         if lemmatize_lang:
             tqdm.write("   Lemmatizing...")
-            text = lemmatize(text, lemmatize_lang)
-
-        lang_dir = os.path.join(output_dir, lang_code)
-        os.makedirs(lang_dir, exist_ok=True)
-        filename = safe_filename(url)
-        filepath = os.path.join(lang_dir, filename)
-        with open(filepath, "w", encoding="utf-8") as f:
-            f.write(text)
+            lemma_text = lemmatize(text, lemmatize_lang)
+            lemma_dir = os.path.join(lang_dir, "lemmatized")
+            os.makedirs(lemma_dir, exist_ok=True)
+            lemma_filename = safe_filename(url, variant="lemma")
+            lemma_filepath = os.path.join(lemma_dir, lemma_filename)
+            with open(lemma_filepath, "w", encoding="utf-8") as f:
+                f.write(lemma_text)
+            saved_note += f"  +  {lang_code}/lemmatized/{lemma_filename}"
 
         seen_hashes.add(raw_hash)
         append_to_manifest(output_dir, normalize_url(url), raw_hash)
-        tqdm.write(f"   ✅ Saved: {lang_code}/{filename}")
+        tqdm.write(f"   ✅ Saved: {saved_note}")
         return True
 
     except Exception as e:
