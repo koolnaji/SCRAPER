@@ -52,7 +52,7 @@ pip install stanza
 
 ```bash
 
-python icelandic\_text\_extractor.py
+python icelandic\\\\\\\_text\\\\\\\_extractor.py
 
 ```
 
@@ -82,7 +82,7 @@ menu entirely):
 
 ```bash
 
-python icelandic\_text\_extractor.py auto https://example.com/news https://example.com/sport
+python icelandic\\\\\\\_text\\\\\\\_extractor.py auto https://example.com/news https://example.com/sport
 
 ```
 
@@ -94,7 +94,7 @@ python icelandic\_text\_extractor.py auto https://example.com/news https://examp
 
 ```bash
 
-python icelandic\_text\_extractor.py url https://example.com/news/some-headline-slug
+python icelandic\\\\\\\_text\\\\\\\_extractor.py url https://example.com/news/some-headline-slug
 
 ```
 
@@ -108,7 +108,7 @@ python icelandic\_text\_extractor.py url https://example.com/news/some-headline-
 
 |---|---|---|
 
-| `--output-dir DIR` | `./news\_corpus` | Where `.txt` files and the manifest are saved |
+| `--output-dir DIR` | `./news\\\\\\\_corpus` | Where `.txt` files and the manifest are saved |
 
 | `--lemmatize LANG` | off | Stanza language code (e.g. `en`, `cy`, `is`) — lemmatizes text before saving |
 
@@ -128,13 +128,13 @@ change it.
 
 
 
-Each saved article is written as `domain\_\_slug\_\_hash.txt`, inside a
+Each saved article is written as `domain\\\\\\\_\\\\\\\_slug\\\\\\\_\\\\\\\_hash.txt`, inside a
 
 \*\*per-language subfolder\*\* of the output directory — e.g.
 
-`news\_corpus/is/ruv.is\_\_some-slug\_\_a1b2c3d4.txt`,
+`news\\\\\\\_corpus/is/ruv.is\\\\\\\_\\\\\\\_some-slug\\\\\\\_\\\\\\\_a1b2c3d4.txt`,
 
-`news\_corpus/en/bbc.com\_\_some-slug\_\_e5f6a7b8.txt`.
+`news\\\\\\\_corpus/en/bbc.com\\\\\\\_\\\\\\\_some-slug\\\\\\\_\\\\\\\_e5f6a7b8.txt`.
 
 
 
@@ -144,13 +144,13 @@ Language is detected automatically from each article's own extracted text
 
 source site, so a mixed-language listing page sorts itself correctly on its
 
-own. Text that can't be confidently classified lands in `news\_corpus/unknown/`
+own. Text that can't be confidently classified lands in `news\\\\\\\_corpus/unknown/`
 
 rather than being dropped.
 
 
 
-A `scraped\_urls.txt` manifest is kept at the \*\*top level\*\* of the output
+A `scraped\\\\\\\_urls.txt` manifest is kept at the \*\*top level\*\* of the output
 
 directory (shared across all language subfolders, since dedup is
 
@@ -194,7 +194,7 @@ Links found on a listing page are kept as candidate articles if they:
 
 \- aren't a static asset (image, PDF, video, etc.), and
 
-\- \*\*either\*\* match a site-specific `listing\_path\_prefixes` override (see
+\- \*\*either\*\* match a site-specific `listing\\\\\\\_path\\\\\\\_prefixes` override (see
 
 &#x20; below) \*\*or\*\*, generically, have a hyphen-rich slug
 
@@ -250,7 +250,7 @@ article, where one such placeholder appeared three times verbatim in a
 
 single piece). This list grows as new patterns turn up — see
 
-`BOILERPLATE\_PATTERNS` in the script.
+`BOILERPLATE\\\\\\\_PATTERNS` in the script.
 
 
 
@@ -258,13 +258,13 @@ single piece). This list grows as new patterns turn up — see
 
 
 
-`SITE\_OVERRIDES` in the script holds evidence-backed extraction rules for
+`SITE\\\\\\\_OVERRIDES` in the script holds evidence-backed extraction rules for
 
-specific domains — built using the included `inspect\_selectors.py` tool (see
+specific domains — built using the included `inspect\\\\\\\_selectors.py` tool (see
 
-below), never guessed. Each entry can supply a proven `article\_selector`,
+below), never guessed. Each entry can supply a proven `article\\\\\\\_selector`,
 
-`exclude\_selectors` for known junk inside it, and/or `listing\_path\_prefixes`
+`exclude\\\\\\\_selectors` for known junk inside it, and/or `listing\\\\\\\_path\\\\\\\_prefixes`
 
 to fix article discovery on sites the generic heuristic can't handle. An
 
@@ -284,13 +284,13 @@ exactly what was tested and observed.
 
 
 
-\*\*Adding a new site:\*\* run `inspect\_selectors.py` against a real article URL
+\*\*Adding a new site:\*\* run `inspect\\\\\\\_selectors.py` against a real article URL
 
 on that site — it prints every plausible container selector ranked by how
 
 much real paragraph text it holds, plus anything suspicious found nested
 
-inside the best match. Paste the output into a `SITE\_OVERRIDES` entry once
+inside the best match. Paste the output into a `SITE\\\\\\\_OVERRIDES` entry once
 
 you've confirmed which selector is actually the article body.
 
@@ -298,7 +298,7 @@ you've confirmed which selector is actually the article body.
 
 ```bash
 
-python inspect\_selectors.py https://example.com/some/real/article
+python inspect\\\\\\\_selectors.py https://example.com/some/real/article
 
 ```
 
@@ -334,7 +334,7 @@ Welsh, Norwegian (Bokmål/Nynorsk), Swedish, Danish, German, French, Spanish)
 
 — if you start scraping a new language and articles keep landing in
 
-`unknown/`, add it to `\_LINGUA\_LANGUAGES` in the script, and spot-check a
+`unknown/`, add it to `\\\\\\\_LINGUA\\\\\\\_LANGUAGES` in the script, and spot-check a
 
 real sample afterward rather than trusting the addition blindly (see the
 
@@ -370,7 +370,7 @@ Icelandic/Norwegian mix-up above for why).
 
 
 
-\## Companion tool: `inspect\_selectors.py`
+\## Companion tool: `inspect\\\\\\\_selectors.py`
 
 
 
@@ -382,13 +382,13 @@ held, plus anything suspicious nested inside the best match (share widgets,
 
 accessibility controls, etc.). Used to build evidence-backed
 
-`SITE\_OVERRIDES` entries — see \*\*Site overrides\*\* above.
+`SITE\\\\\\\_OVERRIDES` entries — see \*\*Site overrides\*\* above.
 
 
 
 ```bash
 
-python inspect\_selectors.py <article\_url>
+python inspect\\\\\\\_selectors.py <article\\\\\\\_url>
 
 ```
 
