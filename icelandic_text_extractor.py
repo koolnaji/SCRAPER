@@ -79,6 +79,14 @@ try:
         Language.ICELANDIC, Language.ENGLISH, Language.WELSH,
         Language.BOKMAL, Language.NYNORSK, Language.SWEDISH, Language.DANISH,
         Language.GERMAN, Language.FRENCH, Language.SPANISH,
+        # Added when lingua got folded into the multi-judge panel
+        # (language_judges.py) -- both are in lingua's own 75-language
+        # set, they just weren't in THIS project's build list before,
+        # meaning NOS.nl (Dutch) articles were being locally misread as
+        # whichever of the above lingua considered closest. Spot-checked
+        # against real samples before trusting them, same caution this
+        # comment already asks for on any newly-added language.
+        Language.DUTCH, Language.IRISH,
     ]
     _lingua_detector = LanguageDetectorBuilder.from_languages(*_LINGUA_LANGUAGES).build()
     LANGDETECT_AVAILABLE = True
@@ -91,6 +99,16 @@ except ImportError:
 DEFAULT_OUTPUT = os.path.join(os.getcwd(), "news_corpus")
 MANIFEST_NAME = "scraped_urls.txt"
 UNKNOWN_LANG_FOLDER = "unknown"
+# Distinct from UNKNOWN_LANG_FOLDER: "unknown" means no judge in the
+# language_judges.py panel had anything to say at all (all four failed
+# to load, or the text was too short/garbled for every one of them).
+# "disputed" means the OPPOSITE problem -- judges DID vote, they just
+# didn't agree enough to trust. Keeping these separate matters for
+# review: an "unknown" article is a coverage/extraction problem, a
+# "disputed" one is a genuine language-identification ambiguity (or a
+# language outside every judge's real competence, like Greenlandic
+# sometimes will be -- see language_judges.py's module docstring).
+DISPUTED_LANG_FOLDER = "disputed"
 
 # Path fragments that almost never indicate an actual article, across
 # most news CMSs (WordPress, custom, Drupal, etc.)
@@ -489,80 +507,44 @@ def lemmatize(text, lang_code):
 # Language detection (drives per-language output subfolders)
 # --------------------------------------------------------------------------
 
-def detect_language(text):
+async def detect_language(text, use_gemini_tiebreak=False):
+    """Runs the full language_judges.py panel (GlotLID, OpenLID-v3, CLD3,
+    lingua) on an article's RAW extracted text -- called before any
+    --lemmatize step, since a lemmatized token stream is a worse
+    detection input than natural text, same reasoning as before.
+
+    The panel itself is synchronous (fastText/gcld3/lingua are all
+    blocking C++/native calls) so it's run via asyncio.to_thread() to
+    avoid stalling the Playwright event loop while four models run --
+    same reason detect_language_llm_sync() gets the to_thread()
+    treatment in language_voices.py.
+
+    Returns (lang_code, dispute_info_or_None):
+      - Consensus (locally, or after a Gemini tiebreak) -> (code, None).
+      - No judge had anything to say -> (UNKNOWN_LANG_FOLDER, None).
+      - Still disputed after all available judges (including Gemini, if
+        use_gemini_tiebreak) -> (DISPUTED_LANG_FOLDER, verdict) -- the
+        verdict is returned so the caller can log the full panel
+        breakdown, which needs the URL this function doesn't have.
+
+    use_gemini_tiebreak mirrors the old detect_language_llm_flag --
+    Gemini is ONLY called here, and ONLY when the local panel alone
+    couldn't resolve, which is what actually cuts Gemini's call volume
+    down (as opposed to just rate-limiting the same per-article call
+    rate the old two-voice system made on every article).
     """
-    Best-effort ISO 639-1 code (e.g. 'is', 'en') for an article's RAW
-    extracted text -- called before any --lemmatize step, since a
-    lemmatized token stream is a worse detection input than natural
-    text. Falls back to UNKNOWN_LANG_FOLDER if lingua isn't installed,
-    or if the detector itself can't decide (very short or ambiguous
-    text) -- the article is still saved either way, just parked in
-    unknown/ instead of being silently dropped over a detection failure.
+    verdict = await asyncio.to_thread(judge_language, text, _lingua_detector)
 
-    _LINGUA_LANGUAGES above is a closed candidate list, not every
-    language lingua knows -- if you start scraping a genuinely new
-    language and it keeps landing in unknown/, add it to that list
-    first (and spot-check a real sample or two -- see this function's
-    surrounding comment on langdetect's Icelandic/Norwegian mix-up for
-    why "add it and trust it blindly" isn't quite safe enough on its own).
-    """
-    if not LANGDETECT_AVAILABLE:
-        return UNKNOWN_LANG_FOLDER
-    sample = text[:2000]  # detection accuracy plateaus well before this; no need for the whole article
-    result = _lingua_detector.detect_language_of(sample)
-    if result is None:
-        return UNKNOWN_LANG_FOLDER
-    return result.iso_code_639_1.name.lower()
+    if not verdict.disputed:
+        return (verdict.code if verdict.code else UNKNOWN_LANG_FOLDER), None
 
+    if use_gemini_tiebreak:
+        gemini_code = await detect_language_llm(text)
+        verdict = reconcile_gemini_tiebreak(verdict, gemini_code)
+        if not verdict.disputed:
+            return verdict.code, None
 
-async def reconcile_language_voices(text, local_lang_code):
-    """Two-voiced language ID: local_lang_code is whatever detect_language()
-    (the lingua voice) already decided; this calls Gemini (the API voice,
-    in language_voices.py) on the SAME text and reconciles the two.
-
-    Three cases, same "don't guess past what the evidence supports"
-    discipline as fetch_captions.py's caption reconciliation on the Welsh
-    project:
-
-      1. API voice has nothing to say (quota exhausted, transient
-         failure, package/key missing) -> fall back to the local voice
-         alone, unchanged. A missing second opinion is not evidence the
-         first opinion is wrong.
-      2. Local voice had nothing to say (UNKNOWN_LANG_FOLDER) -> the API
-         voice decides alone, since there's nothing to disagree WITH.
-         If the API voice also has nothing, stays UNKNOWN_LANG_FOLDER.
-      3. Both voices have an opinion and they MATCH -> use it, nothing
-         to log, two independent detectors agreeing is itself the
-         evidence.
-      4. Both voices have an opinion and they DIFFER -> genuinely
-         ambiguous (code-switched text, a language outside lingua's
-         closed candidate list that it's silently misreading as a close
-         relative, or a bad Gemini call). Rather than silently picking a
-         winner, this is logged to language_disagreements.json for
-         review. The API voice's answer is used for where the file
-         actually gets saved -- it isn't limited to a hardcoded candidate
-         list the way lingua is, so on a genuine split it's the more
-         likely of the two to be right -- but a language that keeps
-         showing up in that log is a signal to add it to
-         _LINGUA_LANGUAGES and re-test, not to just trust the API voice
-         forever.
-
-    Returns (final_lang_code, disagreement_dict_or_None) -- the caller
-    logs the disagreement (it needs the URL, which this function doesn't
-    have) and decides whether to print anything about it.
-    """
-    api_lang_code = await detect_language_llm(text)
-
-    if api_lang_code is None:
-        return local_lang_code, None
-
-    if local_lang_code == UNKNOWN_LANG_FOLDER:
-        return api_lang_code, None
-
-    if local_lang_code == api_lang_code:
-        return local_lang_code, None
-
-    return api_lang_code, {"local": local_lang_code, "api": api_lang_code}
+    return DISPUTED_LANG_FOLDER, verdict
 
 
 # --------------------------------------------------------------------------
@@ -605,8 +587,8 @@ from boilerplate_detector import (
 from language_voices import (
     detect_language_llm,
     reset_language_quota_flag,
-    log_language_disagreement,
 )
+from language_judges import judge_language, reconcile_gemini_tiebreak, log_language_dispute
 from boilerplate_review import run_review
 from term_ui import rule, wrap, half_width
 import textwrap
@@ -955,17 +937,14 @@ async def scrape_one(page, url, output_dir, lemmatize_lang, seen_hashes, index, 
         # lemmatized token stream (already reduced to dictionary forms,
         # function words flattened) is a worse detection input than
         # natural running text.
-        lang_code = detect_language(text)
-        if detect_language_llm_flag:
-            lang_code, disagreement = await reconcile_language_voices(text, lang_code)
-            if disagreement:
-                logged = log_language_disagreement(
-                    output_dir, url, disagreement["local"], disagreement["api"]
-                )
-                if logged:
-                    tqdm.write(f"   🗣️  Language voices disagreed (lingua='{disagreement['local']}' vs "
-                               f"gemini='{disagreement['api']}') -> filed under '{lang_code}', "
-                               f"logged to language_disagreements.json")
+        lang_code, verdict = await detect_language(text, use_gemini_tiebreak=detect_language_llm_flag)
+        if verdict is not None:  # only set when lang_code came back DISPUTED_LANG_FOLDER
+            logged = log_language_dispute(output_dir, url, verdict)
+            if logged:
+                vote_summary = ", ".join(f"{name}={v.code}({v.confidence:.2f})"
+                                          for name, v in verdict.votes.items())
+                tqdm.write(f"   🗣️  Language panel disputed ({vote_summary}) -> filed under "
+                           f"'{DISPUTED_LANG_FOLDER}', logged to language_disputes.json")
         lang_dir = os.path.join(output_dir, lang_code)
 
         # BUGFIX: this used to lemmatize text IN PLACE and only ever save
@@ -1348,10 +1327,10 @@ def interactive_menu():
 
             elif step == "language_llm":
                 state["detect_language_llm_flag"] = _prompt_yes_no(
-                    "\nGet a second opinion on language ID from Gemini, alongside the built-in "
-                    "lingua detector? (one extra API call per article, same free tier/key as "
-                    "boilerplate detection above; when the two disagree, Gemini's answer is used "
-                    "and the split is logged to language_disagreements.json for review)",
+                    "\nAllow Gemini to break ties when the local language-ID panel "
+                    "(GlotLID, OpenLID-v3, CLD3, lingua) genuinely disagrees on an "
+                    "article? Only called for the disputed subset, not every article "
+                    "-- same free tier/key as boilerplate detection above.",
                     default=False,
                 )
                 step = "done"
@@ -1384,7 +1363,7 @@ def interactive_menu():
     print(f"  URLs:       {len(urls)} given")
     print(f"  Lemmatize:  {lemmatize_lang if lemmatize_lang else 'No'}")
     print(f"  Detect boilerplate (LLM): {'Yes' if detect_boilerplate else 'No'}")
-    print(f"  Language ID second voice (LLM): {'Yes' if detect_language_llm_flag else 'No'}")
+    print(f"  Language ID Gemini tiebreak: {'Yes' if detect_language_llm_flag else 'No'}")
     print(f"  Output dir: {output_dir}")
     print(f"{rule('=')}\n")
 

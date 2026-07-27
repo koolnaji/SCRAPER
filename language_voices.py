@@ -1,31 +1,31 @@
 """
 language_voices.py
 ===================
-Two-voiced language identification for the news scraper.
+Gemini-backed language identification -- ONE call this module exposes,
+detect_language_llm(), used by language_judges.py's judge_language()
+ensemble strictly as a TIEBREAKER, not a coequal second voice the way it
+used to be.
 
-Voice 1 ("local"): the existing lingua-based detect_language() already
-in the main script -- fast, free, offline, but limited to the closed
-_LINGUA_LANGUAGES candidate list and (per that function's own comment)
-occasionally wrong on closely-related languages it wasn't specifically
-tested against.
+Old design (superseded): every article got a lingua call AND, if the
+flag was on, a Gemini call, and the two were reconciled directly in the
+main script. That meant Gemini's call volume scaled with total articles
+scraped, which is exactly what ran into the Gemini API's per-minute
+request ceiling (RPM binds far sooner than TPM does for a call this
+small -- a couple hundred tokens per sample against a 5 RPM free-tier
+cap, well before the 250K TPM cap is anywhere close).
 
-Voice 2 ("api"), added here: Gemini, asked the same question over the
-API -- broader effective language coverage since it isn't limited to a
-hardcoded candidate list, but it's a network call on the same
-rate-limited free tier as boilerplate_detector.py.
-
-This module only speaks for voice 2. Reconciling the two voices (what to
-do when they agree, when one has nothing to say, or when they genuinely
-disagree) is the main script's job, in scrape_one() -- kept there rather
-than here since the reconciliation policy needs UNKNOWN_LANG_FOLDER and
-other main-script context, and duplicating that here would risk the two
-copies drifting apart.
+Current design: language_judges.py runs a panel of four LOCAL, offline
+judges (GlotLID, OpenLID-v3, CLD3, lingua) first. Gemini, via this
+module, is only ever invoked for the subset of articles that panel
+couldn't already resolve on its own -- see judge_language() and
+reconcile_gemini_tiebreak() in language_judges.py. That's what actually
+fixes the RPM pressure, not just spreads the same per-article call rate
+out with retries/backoff.
 
 Opt-in only (--detect-language-llm / the interactive-menu prompt), off
-by default, same reasoning as boilerplate_detector.py: an extra
-per-article API call against the same free-tier caps, worth paying for
-specifically when you don't trust lingua's candidate list on what you're
-scraping, not on by default for everything.
+by default -- same reasoning as boilerplate_detector.py: worth paying
+for specifically when the local panel is genuinely split on what you're
+scraping, not something to burn API budget on by default.
 
 Reuses the SAME cached Gemini client as boilerplate_detector.py
 (get_gemini_client() there is a module-level singleton, so this doesn't
@@ -39,12 +39,9 @@ independently trip anyway within a call or two of each other).
 """
 
 import re
-import os
 import json
 import time
 import asyncio
-from datetime import datetime, timezone
-from urllib.parse import urlparse
 
 from boilerplate_detector import (
     get_gemini_client,
@@ -185,57 +182,14 @@ def detect_language_llm_sync(text):
 
 
 async def detect_language_llm(text):
-    """Async wrapper. Unlike boilerplate_detector's equivalent, this
-    swallows get_gemini_client()'s RuntimeError (missing google-genai
-    package or GEMINI_API_KEY) instead of letting it propagate -- the
-    whole point of a two-voiced system is that losing one voice doesn't
-    take down the other, so a missing/misconfigured API voice should
-    just mean "local voice only" here, not fail the article scrape the
-    way it would for the (single-voiced) boilerplate pass."""
+    """Async wrapper. Swallows get_gemini_client()'s RuntimeError (missing
+    google-genai package or GEMINI_API_KEY) instead of letting it
+    propagate -- this is only ever called as a tiebreaker for the subset
+    of articles language_judges.py's local panel couldn't already
+    resolve, so a missing/misconfigured Gemini client should just mean
+    "the dispute stays a dispute, filed under DISPUTED_LANG_FOLDER" here,
+    not fail the article scrape entirely."""
     try:
         return await asyncio.to_thread(detect_language_llm_sync, text)
     except Exception:
         return None
-
-
-def log_language_disagreement(output_dir, url, local_code, api_code):
-    """Appends a record to language_disagreements.json (top level of the
-    output dir, alongside scraped_urls.txt and boilerplate_candidates.json)
-    whenever the two voices genuinely disagree on an article that both
-    had an opinion about. Deduped by URL -- a retried URL shouldn't log
-    the same split decision twice.
-
-    This is a review log, same role as boilerplate_candidates.json: if a
-    particular language code keeps showing up here, it's worth checking
-    whether _LINGUA_LANGUAGES (in the main script) is missing that
-    language, or misreading it as a close relative -- see the
-    Icelandic/Norwegian mix-up documented on detect_language() itself for
-    exactly this failure mode with the local voice alone.
-
-    Returns True if a new entry was added, False if this URL was already
-    logged (so the caller can decide whether to print anything)."""
-    path = os.path.join(output_dir, "language_disagreements.json")
-
-    existing = []
-    if os.path.exists(path):
-        try:
-            with open(path, "r", encoding="utf-8") as f:
-                existing = json.load(f)
-            if not isinstance(existing, list):
-                existing = []
-        except (json.JSONDecodeError, OSError):
-            existing = []  # corrupt/unreadable log shouldn't block new entries
-
-    if any(isinstance(e, dict) and e.get("url") == url for e in existing):
-        return False
-
-    existing.append({
-        "url": url,
-        "domain": urlparse(url).netloc.replace("www.", ""),
-        "local_lingua_code": local_code,
-        "api_gemini_code": api_code,
-        "logged_at": datetime.now(timezone.utc).isoformat(),
-    })
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(existing, f, ensure_ascii=False, indent=2)
-    return True
