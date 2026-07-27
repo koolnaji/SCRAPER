@@ -593,6 +593,9 @@ from boilerplate_patterns import (
     END_OF_ARTICLE_MARKERS,
     READ_MORE_SUFFIXES,
 )
+import boilerplate_patterns  # module object itself, not just its contents --
+                               # boilerplate_review.run_review() needs
+                               # .__file__ to know which file on disk to edit
 from boilerplate_detector import (
     detect_boilerplate_candidates,
     log_boilerplate_candidates,
@@ -604,6 +607,9 @@ from language_voices import (
     reset_language_quota_flag,
     log_language_disagreement,
 )
+from boilerplate_review import run_review
+from term_ui import rule, wrap, half_width
+import textwrap
 
 # BUGFIX: re.compile("|".join([])) compiles to the EMPTY pattern, which
 # matches at every position in every string -- so if any of these three
@@ -1149,51 +1155,74 @@ async def run_url_mode(article_urls, output_dir, lemmatize_lang, delay, detect_b
 # --------------------------------------------------------------------------
 
 class UserQuit(Exception):
-    """Raised by any of the interactive _prompt_* helpers (or the couple
-    of raw input() calls in interactive_menu that don't go through one)
-    the moment the user types 'q' at ANY step of the interactive session
-    -- mode choice, URL entry, yes/no prompts, output-dir, lemmatize lang,
-    all of it. Propagates all the way up to main()'s while-loop, which is
-    the only place it's caught, so quitting from deep inside a nested
-    prompt (e.g. mid confirmation for 'clear') doesn't need every
-    intermediate caller to know how to handle it -- it just unwinds."""
+    """Raised when the user quits the interactive session entirely: typing
+    'q' at the very first wizard step (output_dir -- there's nothing
+    earlier to step back to, so 'q' there really does mean quit) or at
+    the "another run?" prompt after a scrape finishes, outside the wizard
+    altogether. Caught once in main()'s while-loop, so nothing else needs
+    its own try/except for a real quit."""
+    pass
+
+
+class GoBack(UserQuit):
+    """Raised by the _prompt_* helpers when the user types 'q' at any
+    step OTHER than output_dir. interactive_menu()'s step loop catches
+    this itself and re-asks the previous step instead of exiting the
+    program -- that's the whole point of splitting this out from
+    UserQuit.
+
+    It's a UserQuit *subclass*, not a fully separate exception, so that a
+    GoBack raised from a _prompt_* call OUTSIDE the wizard (e.g. the
+    "another run?" prompt in main(), which isn't part of the step stack
+    and has nowhere to step back to) still unwinds all the way out to
+    main()'s `except UserQuit` and quits -- without the shared _prompt_*
+    helpers needing to know whether they're being called from inside the
+    wizard or not."""
     pass
 
 def _print_banner():
-    print("=" * 60)
+    print(rule())
     print("  📰  News Article Scraper")
-    print("=" * 60)
+    print(rule())
 
 
 def _prompt_choice(question, options):
     """options: list of (key, label) tuples. Returns the chosen key.
 
     'q' is always accepted here too, on top of whatever's in options --
-    typing it raises UserQuit rather than being treated as an invalid
-    choice, so quitting doesn't need to be an explicit option on every
-    single call site."""
-    print(f"\n{question}")
+    typing it raises GoBack (a step back, not a full quit -- see GoBack's
+    docstring) rather than being treated as an invalid choice, so
+    quitting doesn't need to be an explicit option on every single call
+    site."""
+    print(f"\n{wrap(question)}")
     for key, label in options:
-        print(f"  {key}) {label}")
-    print("  q) Quit")
+        prefix = f"  {key}) "
+        # subsequent_indent is spaces matching the prefix's length, not
+        # the prefix text itself -- a wrapped continuation line should
+        # align under the label, not repeat "  review) " on every line.
+        print(textwrap.fill(label, width=half_width(),
+                             initial_indent=prefix,
+                             subsequent_indent=" " * len(prefix)))
+    print("  q) Back")
     valid_keys = [k.lower() for k, _ in options]
     while True:
         choice = input("> ").strip().lower()
         if choice == "q":
-            raise UserQuit
+            raise GoBack
         if choice in valid_keys:
             return choice
         print(f"   Please enter one of: {', '.join(k for k, _ in options)}, q")
 
 
 def _prompt_urls(prompt_text):
-    print(f"\n{prompt_text}")
-    print("(paste one or more URLs -- comma-separated, or one per line; blank line when done, q to quit)")
+    print(f"\n{wrap(prompt_text)}")
+    print(wrap("(paste one or more URLs -- comma-separated, or one per line; "
+                "blank line when done, q to go back)"))
     urls = []
     while True:
         line = input("> ").strip()
         if line.lower() == "q":
-            raise UserQuit
+            raise GoBack
         if not line:
             if urls:
                 break
@@ -1205,10 +1234,11 @@ def _prompt_urls(prompt_text):
 
 def _prompt_yes_no(question, default=False):
     suffix = "Y/n" if default else "y/N"
+    print(wrap(question))
     while True:
-        ans = input(f"{question} [{suffix}/q] ").strip().lower()
+        ans = input(f"[{suffix}/q] ").strip().lower()
         if ans == "q":
-            raise UserQuit
+            raise GoBack
         if not ans:
             return default
         if ans in ("y", "yes"):
@@ -1221,76 +1251,142 @@ def _prompt_yes_no(question, default=False):
 def interactive_menu():
     _print_banner()
 
-    # Asked FIRST now (used to be asked last) -- clear/delete need to know
-    # which output dir's files to act on, and both are reachable from the
-    # mode-choice prompt below, so the directory has to be known before
-    # that prompt runs, not after.
-    output_dir = input(f"Output directory [{DEFAULT_OUTPUT}] (q to quit): ").strip()
-    if output_dir.lower() == "q":
-        raise UserQuit
-    output_dir = output_dir or DEFAULT_OUTPUT
+    # Step-stack wizard: `history` holds the names of steps actually
+    # visited, in order, so a GoBack can pop back to whichever step was
+    # really asked before this one -- including skipping over
+    # "lemmatize_lang" on the way back if it was never asked (do_lemmatize
+    # was No), since it's simply never on the stack in that case. `state`
+    # holds each step's collected answer, keyed by step name, so
+    # re-visiting a step on the way back doesn't lose the OTHER answers
+    # already given.
+    history = []
+    state = {}
+    step = "output_dir"
 
-    # Loops on 'clear'/'delete' since those are one-off maintenance
-    # actions, not a mode to scrape in -- do the action, then show the
-    # choice again instead of falling through into the URL/lemmatize/
-    # detect-boilerplate prompts below.
-    while True:
-        mode_key = _prompt_choice(
-            "What would you like to do?",
-            [("1", "Auto-discover articles from a listing/section page"),
-             ("2", "Scrape specific article URL(s) directly"),
-             ("clear", f"Delete downloaded article .txt files for '{output_dir}' (raw + lemmatized; resets scraped_urls.txt too)"),
-             ("delete", f"Delete boilerplate_candidates.json for '{output_dir}' (the LLM review log)")],
-        )
-        if mode_key == "clear":
-            clear_downloaded_articles(output_dir)
-            continue
-        if mode_key == "delete":
-            delete_boilerplate_log(output_dir)
-            continue
-        break
+    while step != "done":
+        history.append(step)
+        try:
+            if step == "output_dir":
+                # The one real quit point -- asked FIRST (used to be
+                # asked last) since clear/delete need to know which
+                # output dir's files to act on, and both are reachable
+                # from the mode-choice step below, so the directory has
+                # to be known before that step runs, not after. There's
+                # nothing before this step, so 'q' here raises UserQuit
+                # directly rather than GoBack -- see UserQuit vs GoBack's
+                # docstrings for why that split exists.
+                output_dir = input(f"Output directory [{DEFAULT_OUTPUT}] (q to quit): ").strip()
+                if output_dir.lower() == "q":
+                    raise UserQuit
+                state["output_dir"] = output_dir or DEFAULT_OUTPUT
+                step = "mode"
 
-    mode = "auto" if mode_key == "1" else "url"
+            elif step == "mode":
+                output_dir = state["output_dir"]
+                mode_key = _prompt_choice(
+                    "What would you like to do?",
+                    [("1", "Auto-discover articles from a listing/section page"),
+                     ("2", "Scrape specific article URL(s) directly"),
+                     ("review", f"Review boilerplate_candidates.json for '{output_dir}' and promote approved patterns into boilerplate_patterns.py"),
+                     ("clear", f"Delete downloaded article .txt files for '{output_dir}' (raw + lemmatized; resets scraped_urls.txt too)"),
+                     ("delete", f"Delete boilerplate_candidates.json for '{output_dir}' (the LLM review log)")],
+                )
+                # review/clear/delete are one-off maintenance actions, not
+                # a mode to scrape in -- do the action, then re-show this
+                # SAME step rather than advancing. Popping the just-
+                # appended "mode" back off history before looping keeps
+                # the stack accurate: re-entering the top of the while
+                # loop appends "mode" again, so it isn't double-counted.
+                if mode_key == "review":
+                    run_review(output_dir, boilerplate_patterns)
+                    history.pop()
+                    continue
+                if mode_key == "clear":
+                    clear_downloaded_articles(output_dir)
+                    history.pop()
+                    continue
+                if mode_key == "delete":
+                    delete_boilerplate_log(output_dir)
+                    history.pop()
+                    continue
+                state["mode"] = "auto" if mode_key == "1" else "url"
+                step = "urls"
 
-    urls = _prompt_urls(
-        "Enter the listing/section page URL(s):" if mode == "auto"
-        else "Enter the article URL(s):"
-    )
+            elif step == "urls":
+                mode = state["mode"]
+                state["urls"] = _prompt_urls(
+                    "Enter the listing/section page URL(s):" if mode == "auto"
+                    else "Enter the article URL(s):"
+                )
+                step = "lemmatize_yn"
 
-    do_lemmatize = _prompt_yes_no(
-        "\nLemmatize the saved text (reduce every word to dictionary form)?",
-        default=False,
-    )
-    lemmatize_lang = None
-    if do_lemmatize:
-        lemmatize_lang = input("   Stanza language code (e.g. is, en, cy) (q to quit): ").strip()
-        if lemmatize_lang.lower() == "q":
-            raise UserQuit
-        lemmatize_lang = lemmatize_lang or None
+            elif step == "lemmatize_yn":
+                state["do_lemmatize"] = _prompt_yes_no(
+                    "\nLemmatize the saved text (reduce every word to dictionary form)?",
+                    default=False,
+                )
+                # lemmatize_lang only gets a turn on the stack -- and
+                # therefore only gets landed on by a later GoBack -- when
+                # it was actually asked.
+                step = "lemmatize_lang" if state["do_lemmatize"] else "boilerplate"
 
-    detect_boilerplate = _prompt_yes_no(
-        "\nUse Gemini's free API tier to flag possible leftover boilerplate for review? "
-        "(one API call per saved article, rate-limited on the free tier, "
-        "requires GEMINI_API_KEY; candidates are only logged, never auto-applied)",
-        default=False,
-    )
+            elif step == "lemmatize_lang":
+                lemmatize_lang = input("   Stanza language code (e.g. is, en, cy) (q to go back): ").strip()
+                if lemmatize_lang.lower() == "q":
+                    raise GoBack
+                state["lemmatize_lang"] = lemmatize_lang or None
+                step = "boilerplate"
 
-    detect_language_llm_flag = _prompt_yes_no(
-        "\nGet a second opinion on language ID from Gemini, alongside the built-in "
-        "lingua detector? (one extra API call per article, same free tier/key as "
-        "boilerplate detection above; when the two disagree, Gemini's answer is used "
-        "and the split is logged to language_disagreements.json for review)",
-        default=False,
-    )
+            elif step == "boilerplate":
+                state["detect_boilerplate"] = _prompt_yes_no(
+                    "\nUse Gemini's free API tier to flag possible leftover boilerplate for review? "
+                    "(one API call per saved article, rate-limited on the free tier, "
+                    "requires GEMINI_API_KEY; candidates are only logged, never auto-applied)",
+                    default=False,
+                )
+                step = "language_llm"
 
-    print(f"\n{'=' * 60}")
+            elif step == "language_llm":
+                state["detect_language_llm_flag"] = _prompt_yes_no(
+                    "\nGet a second opinion on language ID from Gemini, alongside the built-in "
+                    "lingua detector? (one extra API call per article, same free tier/key as "
+                    "boilerplate detection above; when the two disagree, Gemini's answer is used "
+                    "and the split is logged to language_disagreements.json for review)",
+                    default=False,
+                )
+                step = "done"
+
+        except GoBack:
+            # Discard the step we just backed out of, then pop the step
+            # before it off the stack to become current again -- it'll be
+            # re-appended at the top of the next iteration, so this isn't
+            # a permanent removal, just "rewind the stack pointer by one".
+            history.pop()
+            if not history:
+                # Backed out past the very first step -- nothing earlier
+                # to return to, so this IS a real quit (the "except when
+                # it should" case: only output_dir raises UserQuit
+                # directly, but backing all the way past mode/urls/etc.
+                # in a row lands here too, and should behave the same
+                # way).
+                raise UserQuit
+            step = history.pop()
+
+    output_dir = state["output_dir"]
+    mode = state["mode"]
+    urls = state["urls"]
+    lemmatize_lang = state.get("lemmatize_lang")
+    detect_boilerplate = state["detect_boilerplate"]
+    detect_language_llm_flag = state["detect_language_llm_flag"]
+
+    print(f"\n{rule('=')}")
     print(f"  Mode:       {'Auto-discover' if mode == 'auto' else 'Direct URL(s)'}")
     print(f"  URLs:       {len(urls)} given")
     print(f"  Lemmatize:  {lemmatize_lang if lemmatize_lang else 'No'}")
     print(f"  Detect boilerplate (LLM): {'Yes' if detect_boilerplate else 'No'}")
     print(f"  Language ID second voice (LLM): {'Yes' if detect_language_llm_flag else 'No'}")
     print(f"  Output dir: {output_dir}")
-    print(f"{'=' * 60}\n")
+    print(f"{rule('=')}\n")
 
     return mode, urls, output_dir, lemmatize_lang, detect_boilerplate, detect_language_llm_flag
 
@@ -1310,14 +1406,16 @@ def main():
         # interactive session -- meant doing a second run required
         # relaunching the script from scratch. Now loops back to the menu
         # after each run and asks whether to go again, until you say no.
-        # UserQuit can be raised from literally any prompt inside
-        # interactive_menu() -- mode choice, URL entry, output-dir,
-        # lemmatize lang, the clear/delete confirmations, the
-        # detect-boilerplate yes/no, all of it -- since every one of
-        # those prompts now accepts 'q'. Catching it once here, around
-        # the whole loop, means none of the intermediate functions need
-        # their own try/except; typing 'q' anywhere just unwinds straight
-        # to this one exit point.
+        # UserQuit is only raised for a REAL quit now: typing 'q' at the
+        # very first wizard step (output_dir), backing out past it via a
+        # string of GoBacks, or 'q' at the "another run?" prompt below.
+        # Every other 'q' inside interactive_menu() raises GoBack instead,
+        # which is caught internally by the wizard's own step loop and
+        # turned into "re-ask the previous step" -- it never reaches this
+        # except block. Since GoBack subclasses UserQuit, this one
+        # except still catches both: a GoBack from the "another run?"
+        # prompt (which isn't part of the wizard's step stack) unwinds
+        # here exactly like a real UserQuit would.
         try:
             while True:
                 (mode, urls, output_dir, lemmatize_lang, detect_boilerplate,
@@ -1376,6 +1474,9 @@ def main():
     delete_p.add_argument("--output-dir", default=DEFAULT_OUTPUT)
     delete_p.add_argument("--yes", action="store_true", help="Skip the confirmation prompt")
 
+    review_p = sub.add_parser("review", help="Interactively review boilerplate_candidates.json and promote approved patterns into boilerplate_patterns.py")
+    review_p.add_argument("--output-dir", default=DEFAULT_OUTPUT)
+
     args = parser.parse_args()
 
     if args.mode == "auto":
@@ -1390,6 +1491,8 @@ def main():
         clear_downloaded_articles(args.output_dir, skip_confirm=args.yes)
     elif args.mode == "delete":
         delete_boilerplate_log(args.output_dir, skip_confirm=args.yes)
+    elif args.mode == "review":
+        run_review(args.output_dir, boilerplate_patterns)
 
 
 if __name__ == "__main__":

@@ -51,6 +51,10 @@ from boilerplate_detector import (
     DETECTION_MODEL,
     MAX_RETRIES,
     INITIAL_BACKOFF_SECONDS,
+    rotate_gemini_key,
+    mark_gemini_key_exhausted,
+    gemini_key_count,
+    reset_gemini_key_pool,
 )
 
 # Same slice detect_language() (the local lingua voice, in the main
@@ -79,9 +83,14 @@ def reset_language_quota_flag():
     before any scraping begins, mirroring boilerplate_detector.py's
     reset_quota_flag() -- so a previous run's rate-limit trip doesn't
     silently carry over into a fresh one in the same interactive-menu
-    session."""
+    session. Also resets the SHARED key-exhaustion pool (via
+    reset_gemini_key_pool(), not reset_quota_flag() itself, since this
+    flag and boilerplate's are intentionally independent -- see module
+    docstring) so a previous run's rotated-through keys get another
+    chance too."""
     global _lang_quota_exhausted
     _lang_quota_exhausted = False
+    reset_gemini_key_pool()
 
 
 def _parse_language_response(raw_response_text):
@@ -103,7 +112,7 @@ def _parse_language_response(raw_response_text):
     return code
 
 
-def _call_gemini_with_retry(client, sample):
+def _call_gemini_with_retry(sample):
     global _lang_quota_exhausted
     if _lang_quota_exhausted:
         return None
@@ -116,27 +125,44 @@ def _call_gemini_with_retry(client, sample):
                                  # tier token burn negligible per call
         response_mime_type="application/json",
     )
-    for attempt in range(MAX_RETRIES):
-        try:
-            return client.models.generate_content(
-                model=DETECTION_MODEL,
-                contents=sample,
-                config=config,
-            )
-        except Exception as e:
-            msg = str(e)
-            is_rate_limit = "429" in msg or "RESOURCE_EXHAUSTED" in msg
-            if is_rate_limit and attempt < MAX_RETRIES - 1:
-                time.sleep(INITIAL_BACKOFF_SECONDS * (2 ** attempt))
-                continue
-            if is_rate_limit:
-                _lang_quota_exhausted = True
-                print("\n⚠️  Gemini API rate/quota limit hit repeatedly -- "
-                      "pausing the LLM language voice for the rest of this "
-                      "run. Language detection keeps going on the local "
-                      "lingua voice alone, just without a second opinion.")
-            return None
-    return None
+    while True:
+        client = get_gemini_client()  # current active key -- may have
+                                        # changed since the last call if a
+                                        # rotation happened partway
+                                        # through this run (possibly
+                                        # triggered by the OTHER voice,
+                                        # boilerplate detection -- they
+                                        # share one pool)
+        for attempt in range(MAX_RETRIES):
+            try:
+                return client.models.generate_content(
+                    model=DETECTION_MODEL,
+                    contents=sample,
+                    config=config,
+                )
+            except Exception as e:
+                msg = str(e)
+                is_rate_limit = "429" in msg or "RESOURCE_EXHAUSTED" in msg
+                if is_rate_limit and attempt < MAX_RETRIES - 1:
+                    time.sleep(INITIAL_BACKOFF_SECONDS * (2 ** attempt))
+                    continue
+                if not is_rate_limit:
+                    return None  # not a rate-limit issue -- rotating keys wouldn't help
+                break  # persistent 429s on THIS key after MAX_RETRIES
+
+        mark_gemini_key_exhausted()
+        if gemini_key_count() > 1 and rotate_gemini_key():
+            print("\n🔁 Gemini key exhausted -- rotating to the next key in "
+                  "GEMINI_API_KEYS and retrying (language voice)...")
+            continue
+
+        _lang_quota_exhausted = True
+        which = "the only configured key" if gemini_key_count() == 1 else "every configured key"
+        print(f"\n⚠️  Gemini API rate/quota limit hit repeatedly on {which} -- "
+              "pausing the LLM language voice for the rest of this run. "
+              "Language detection keeps going on the local lingua voice "
+              "alone, just without a second opinion.")
+        return None
 
 
 def detect_language_llm_sync(text):
@@ -147,9 +173,9 @@ def detect_language_llm_sync(text):
     said "unknown") -- None means "no second opinion available", not
     "the article has no language", so callers should fall back to the
     local voice rather than treating None as a real answer."""
-    client = get_gemini_client()
+    get_gemini_client()  # fail fast if package/key(s) missing
     sample = text[:MAX_SAMPLE_CHARS]
-    response = _call_gemini_with_retry(client, sample)
+    response = _call_gemini_with_retry(sample)
     if response is None:
         return None
     raw = getattr(response, "text", None)

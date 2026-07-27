@@ -24,6 +24,11 @@ package. Requires:
   pip install google-genai
   export GEMINI_API_KEY=...   (free key: https://aistudio.google.com/apikey)
 
+  Optional: export GEMINI_API_KEYS="key1,key2,key3" instead, to rotate
+  across multiple free-tier keys when one runs into its rate/quota limit
+  (see the _GeminiKeyPool class below for details and a terms-of-service
+  caveat worth reading first).
+
 Two things worth knowing about the free tier before turning this on:
   1. It's rate-limited (requests-per-minute AND requests-per-day caps).
      Scraping a large batch with this on can burn through the daily quota
@@ -88,7 +93,6 @@ Respond with ONLY a JSON array. Each element must be an object with exactly two 
 Example response: [{"fragment": "Follow us on social media", "reason": "social-share prompt"}]
 If nothing is flagged, respond with: []"""
 
-_gemini_client = None
 _quota_exhausted = False  # tripped for the rest of a RUN once free-tier
                           # quota looks genuinely exhausted, not just a
                           # transient rate-limit blip -- reset at the start
@@ -110,37 +114,154 @@ def reset_quota_flag():
     doesn't silently carry over into a fresh one in the same process."""
     global _quota_exhausted
     _quota_exhausted = False
+    _key_pool.reset()
+
+
+def reset_gemini_key_pool():
+    """Standalone reset for callers that need to clear key-exhaustion
+    tracking without touching THIS module's own _quota_exhausted flag --
+    language_voices.py's reset_language_quota_flag() calls this directly
+    rather than reset_quota_flag(), since the two flags are intentionally
+    independent (see language_voices.py's module docstring) even though
+    they share this one underlying key pool."""
+    _key_pool.reset()
+
+
+class _GeminiKeyPool:
+    """Manages one or more Gemini API keys, rotating to the next one when
+    the current key's free-tier quota runs out mid-run instead of just
+    giving up. Reads GEMINI_API_KEYS (comma- or newline-separated) if
+    set, falling back to the single-key GEMINI_API_KEY for anyone not
+    using multiple keys -- so rotation is opt-in by way of which env var
+    you set, no separate flag needed.
+
+    NOTE ON TERMS OF SERVICE: rotating multiple free-tier keys/projects
+    specifically to route around Google's rate limit is generally
+    understood to run against the free tier's terms of service -- this
+    exists because it was explicitly requested with that tradeoff in
+    mind, not because it's risk-free. Worth reading
+    https://ai.google.dev/gemini-api/docs/billing yourself before relying
+    on this for anything you can't afford to have a key suspended over.
+
+    One client per key, created lazily and cached (same reasoning as the
+    single-client version this replaced -- don't pay setup cost for keys
+    that never end up needed). Keys marked "exhausted" stay marked for
+    the rest of the run (cleared by reset()), so a key that's already
+    known to be out of quota isn't retried every single call.
+    """
+
+    def __init__(self):
+        self._keys = None
+        self._clients = {}
+        self._exhausted = set()
+        self._active_idx = 0
+
+    def _load_keys(self):
+        if self._keys is not None:
+            return
+        raw = os.environ.get("GEMINI_API_KEYS") or os.environ.get("GEMINI_API_KEY")
+        if not raw:
+            raise RuntimeError(
+                "--detect-boilerplate / --detect-language-llm require a "
+                "GEMINI_API_KEY (single key) or GEMINI_API_KEYS (comma- or "
+                "newline-separated, for rotation across multiple keys) "
+                "environment variable. Free key, no credit card required: "
+                "https://aistudio.google.com/apikey"
+            )
+        seen = set()
+        keys = []
+        for k in re.split(r"[,\n]", raw):
+            k = k.strip()
+            if k and k not in seen:
+                seen.add(k)
+                keys.append(k)
+        self._keys = keys
+
+    def get_client(self):
+        self._load_keys()
+        from google import genai
+        key = self._keys[self._active_idx]
+        if key not in self._clients:
+            self._clients[key] = genai.Client(api_key=key)
+        return self._clients[key]
+
+    def key_count(self):
+        self._load_keys()
+        return len(self._keys)
+
+    def mark_current_exhausted(self):
+        self._load_keys()
+        self._exhausted.add(self._keys[self._active_idx])
+
+    def rotate(self):
+        """Advances to the next key that hasn't already been marked
+        exhausted this run. Returns True if a fresh key is now active,
+        False if every key in the pool is exhausted -- nothing left to
+        rotate to, caller should give up for the rest of the run."""
+        self._load_keys()
+        for _ in range(len(self._keys)):
+            self._active_idx = (self._active_idx + 1) % len(self._keys)
+            if self._keys[self._active_idx] not in self._exhausted:
+                return True
+        return False
+
+    def reset(self):
+        """Clears exhausted-key tracking for a fresh run -- same
+        reasoning as reset_quota_flag() generally: a previous run's
+        exhaustion shouldn't silently carry over into a new one in the
+        same interactive-menu session. Deliberately keeps whichever key
+        is currently active rather than resetting to key 0, so repeated
+        runs in one session spread load across the pool instead of
+        hammering the first key every time."""
+        self._exhausted.clear()
+
+
+_key_pool = _GeminiKeyPool()
 
 
 def get_gemini_client():
-    """Lazily creates and caches the Gemini client, same lazy-init
-    pattern as ensure_lemmatizer()'s Stanza pipeline -- only pay the
-    import/setup cost if --detect-boilerplate is actually used.
-
-    Fails fast with a clear message (missing package, missing API key)
-    rather than a generic error buried inside the first article's
-    scrape, matching the ensure_lemmatizer() fail-fast discipline.
+    """Returns the client for whichever key is CURRENTLY ACTIVE in the
+    pool -- see rotate_gemini_key() for how that changes mid-run when a
+    key's quota runs out. Fails fast with a clear message (missing
+    package, missing key(s)) rather than a generic error buried inside
+    the first article's scrape, matching the ensure_lemmatizer()
+    fail-fast discipline.
     """
-    global _gemini_client
-    if _gemini_client is not None:
-        return _gemini_client
     try:
-        from google import genai
+        from google import genai  # noqa: F401 -- import check only, for
+                                    # the friendly error message below;
+                                    # the pool does its own import too
     except ImportError:
         raise RuntimeError(
-            "--detect-boilerplate requires the 'google-genai' package "
-            "(not the older 'google-generativeai'). "
+            "--detect-boilerplate / --detect-language-llm require the "
+            "'google-genai' package (not the older 'google-generativeai'). "
             "Install it with: pip install google-genai"
         )
-    api_key = os.environ.get("GEMINI_API_KEY")
-    if not api_key:
-        raise RuntimeError(
-            "--detect-boilerplate requires a GEMINI_API_KEY environment "
-            "variable to be set. Free key, no credit card required: "
-            "https://aistudio.google.com/apikey"
-        )
-    _gemini_client = genai.Client(api_key=api_key)
-    return _gemini_client
+    return _key_pool.get_client()
+
+
+def rotate_gemini_key():
+    """Advances the shared key pool to its next non-exhausted key.
+    Returns True if a fresh key is now active, False if every key has
+    been exhausted this run. Exposed at module level (rather than just
+    on _key_pool) so language_voices.py's independent retry loop can
+    trigger rotation on the SAME pool -- a key exhausted by a boilerplate
+    call is exhausted for a language call too, same account either way."""
+    return _key_pool.rotate()
+
+
+def mark_gemini_key_exhausted():
+    """Marks the pool's currently active key as exhausted for the rest of
+    this run. See rotate_gemini_key() for why this is shared with
+    language_voices.py rather than each module tracking its own."""
+    _key_pool.mark_current_exhausted()
+
+
+def gemini_key_count():
+    """How many keys are configured (1 unless GEMINI_API_KEYS has more).
+    Used to decide whether "rotate" is even a meaningful option, and to
+    phrase the exhaustion message correctly (singular vs plural)."""
+    return _key_pool.key_count()
 
 
 def _parse_candidates(raw_response_text):
@@ -165,7 +286,7 @@ def _parse_candidates(raw_response_text):
     return candidates
 
 
-def _call_gemini_with_retry(client, sample):
+def _call_gemini_with_retry(sample):
     global _quota_exhausted
     if _quota_exhausted:
         return None
@@ -178,28 +299,45 @@ def _call_gemini_with_retry(client, sample):
                                                   # to ask nicely for no
                                                   # markdown fences
     )
-    for attempt in range(MAX_RETRIES):
-        try:
-            return client.models.generate_content(
-                model=DETECTION_MODEL,
-                contents=sample,
-                config=config,
-            )
-        except Exception as e:
-            msg = str(e)
-            is_rate_limit = "429" in msg or "RESOURCE_EXHAUSTED" in msg
-            if is_rate_limit and attempt < MAX_RETRIES - 1:
-                time.sleep(INITIAL_BACKOFF_SECONDS * (2 ** attempt))
-                continue
-            if is_rate_limit:
-                _quota_exhausted = True
-                print("\n⚠️  Gemini API rate/quota limit hit repeatedly -- "
-                      "pausing boilerplate detection for the rest of this "
-                      "run (free-tier RPM/RPD caps are easy to hit on a "
-                      "big batch). The rest of the scrape keeps going "
-                      "normally, just without this check.")
-            return None
-    return None
+    while True:
+        client = get_gemini_client()  # current active key -- may have
+                                        # changed since the last call if a
+                                        # rotation happened partway
+                                        # through this run
+        for attempt in range(MAX_RETRIES):
+            try:
+                return client.models.generate_content(
+                    model=DETECTION_MODEL,
+                    contents=sample,
+                    config=config,
+                )
+            except Exception as e:
+                msg = str(e)
+                is_rate_limit = "429" in msg or "RESOURCE_EXHAUSTED" in msg
+                if is_rate_limit and attempt < MAX_RETRIES - 1:
+                    time.sleep(INITIAL_BACKOFF_SECONDS * (2 ** attempt))
+                    continue
+                if not is_rate_limit:
+                    return None  # not a rate-limit issue -- rotating keys wouldn't help
+                break  # persistent 429s on THIS key after MAX_RETRIES
+
+        # Current key looks genuinely exhausted (not just a transient
+        # blip -- that's what the retry loop above already absorbed).
+        # Mark it and try the next key in the pool before giving up.
+        mark_gemini_key_exhausted()
+        if gemini_key_count() > 1 and rotate_gemini_key():
+            print("\n🔁 Gemini key exhausted -- rotating to the next key in "
+                  "GEMINI_API_KEYS and retrying...")
+            continue
+
+        _quota_exhausted = True
+        which = "the only configured key" if gemini_key_count() == 1 else "every configured key"
+        print(f"\n⚠️  Gemini API rate/quota limit hit repeatedly on {which} -- "
+              "pausing boilerplate detection for the rest of this run "
+              "(free-tier RPM/RPD caps are easy to hit on a big batch). The "
+              "rest of the scrape keeps going normally, just without this "
+              "check.")
+        return None
 
 
 def detect_boilerplate_candidates_sync(text):
@@ -209,13 +347,13 @@ def detect_boilerplate_candidates_sync(text):
     ordinary API hiccups -- returns [] and lets the caller decide whether
     to note the failure, since a detection failure is not a reason to
     fail the whole scrape."""
-    client = get_gemini_client()
+    get_gemini_client()  # fail fast if package/key(s) missing, before doing any slicing work
     if len(text) > MAX_HEAD_CHARS + MAX_TAIL_CHARS:
         sample = text[:MAX_HEAD_CHARS] + "\n\n[... article middle omitted ...]\n\n" + text[-MAX_TAIL_CHARS:]
     else:
         sample = text
 
-    response = _call_gemini_with_retry(client, sample)
+    response = _call_gemini_with_retry(sample)
     if response is None:
         return []
     raw = getattr(response, "text", None)
