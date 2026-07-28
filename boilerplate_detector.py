@@ -17,6 +17,31 @@ SITE_OVERRIDES. Nothing here auto-edits boilerplate_patterns.py.
 Opt-in only (--detect-boilerplate / the interactive-menu prompt), off by
 default.
 
+Two-track redesign to relieve free-tier RPM pressure (a per-article call
+on every scraped article was the actual bottleneck, same shape of
+problem language ID had before language_judges.py -- see is_suspicious()
+and queue_boilerplate_check() below):
+
+  Track 1 -- suspicion filter: most well-formed, normal-length articles
+  never generate an LLM call at all now. is_suspicious() decides on cheap
+  local signals (word count, short-paragraph ratio) whether an article's
+  extracted text is even worth spending a call on. Deliberately biased
+  the other way for SHORT text specifically: a suspiciously short
+  extraction is exactly the shape of a genuine extraction failure (see
+  DR.dk's cookie-banner-as-full-article bug), so short articles are MORE
+  likely to get checked, not less -- the filter cuts volume on the
+  articles that are probably fine, not on the ones most likely to
+  actually need review.
+
+  Track 2 -- batching: articles that DO pass the suspicion filter aren't
+  sent one at a time either. They queue up (queue_boilerplate_check) and
+  get sent as ONE combined request per BATCH_SIZE articles
+  (flush_boilerplate_queue), since the free tier's real constraint is
+  requests-per-minute, not tokens-per-minute -- a batch of a dozen-plus
+  short article samples is still a small fraction of the TPM cap, so
+  batching turns N requests into 1 for a proportional RPM saving without
+  meaningfully touching the OTHER limit.
+
 Uses Google's Gemini API (genuine free tier, no credit card required) via
 the official `google-genai` SDK, not the older `google-generativeai`
 package. Requires:
@@ -27,7 +52,10 @@ package. Requires:
   Optional: export GEMINI_API_KEYS="key1,key2,key3" instead, to rotate
   across multiple free-tier keys when one runs into its rate/quota limit
   (see the _GeminiKeyPool class below for details and a terms-of-service
-  caveat worth reading first).
+  caveat worth reading first). NOTE: per Google's own rate-limit docs,
+  quota is enforced per PROJECT, not per key -- rotation here only helps
+  if these keys are actually on separate Google Cloud projects; same-
+  project keys share one pool and rotating between them buys nothing.
 
 Two things worth knowing about the free tier before turning this on:
   1. It's rate-limited (requests-per-minute AND requests-per-day caps).
@@ -46,9 +74,13 @@ Two things worth knowing about the free tier before turning this on:
 import os
 import re
 import json
-import time
+import asyncio
 from datetime import datetime, timezone
 from urllib.parse import urlparse
+
+from tqdm import tqdm
+
+from gemini_retry import GeminiRetryCaller
 
 # Free-tier model as of July 2026. Google ships new Flash generations
 # every few months (this went 2.5 -> 3 -> 3.5 -> 3.6 across 2026 alone) --
@@ -93,27 +125,128 @@ Respond with ONLY a JSON array. Each element must be an object with exactly two 
 Example response: [{"fragment": "Follow us on social media", "reason": "social-share prompt"}]
 If nothing is flagged, respond with: []"""
 
-_quota_exhausted = False  # tripped for the rest of a RUN once free-tier
-                          # quota looks genuinely exhausted, not just a
-                          # transient rate-limit blip -- reset at the start
-                          # of each top-level run_auto/run_url_mode call,
-                          # same pattern as cysill_client.py's
-                          # reset_cysill_circuit_breaker() on the Welsh
-                          # project. Without a reset, one run that trips
-                          # this (which can happen from a burst of RPM-
-                          # limit 429s, not just genuine daily-quota
-                          # exhaustion) would silently disable boilerplate
-                          # detection for every subsequent run in the same
-                          # interactive-menu session, with no way back on
-                          # short of restarting the script.
+# --------------------------------------------------------------------------
+# Track 1: suspicion filter -- decides whether an article is even worth
+# an LLM pass. See module docstring for the "short = MORE suspicious,
+# not less" reasoning.
+# --------------------------------------------------------------------------
+MIN_WORDS_FOR_TRUST = 80  # below this word count, always check -- this is
+                           # roughly the size of a short blurb; DR.dk's
+                           # cookie-banner-as-full-article bug produced
+                           # well under this many words, and a genuinely
+                           # short-but-legitimate article costs one wasted
+                           # batch slot, which is cheap insurance against
+                           # silently filing a broken extraction
+
+MIN_PARAGRAPHS_FOR_LINE_SHAPE_CHECK = 3   # below this many paragraphs,
+                                           # the ratio check below is too
+                                           # noisy on such a small sample
+                                           # to mean anything (skip it,
+                                           # the word-count check above
+                                           # already covers very short
+                                           # articles anyway)
+SHORT_PARAGRAPH_WORD_LIMIT = 6            # a paragraph this short reads
+                                           # more like a nav link or list
+                                           # item than a sentence
+SHORT_PARAGRAPH_RATIO_THRESHOLD = 0.4     # if >=40% of an article's
+                                           # paragraphs are that short,
+                                           # the overall SHAPE looks like
+                                           # a leaked link list / related-
+                                           # content block rather than
+                                           # normal prose, regardless of
+                                           # total word count
+
+
+def is_suspicious(text):
+    """True = worth an LLM boilerplate pass (queue it). False = looks
+    like normal, well-formed prose -- skip the LLM pass entirely. This
+    is where most of the call-volume reduction actually comes from,
+    since most scraped articles ARE normal prose and never reach Gemini
+    at all under this gate; see the module docstring's Track 1.
+
+    Two DIFFERENT failure shapes get checked here, deliberately kept as
+    separate signals rather than one combined score:
+
+      - Edge check: a single short/boilerplate-looking line at the very
+        start or end of the article, however long the article otherwise
+        is. Boilerplate concentrates at the edges in practice (bylines/
+        consent banners up top, footers/related-content/promo blocks at
+        the bottom -- see MAX_HEAD_CHARS/MAX_TAIL_CHARS's own comment on
+        this same pattern). One boilerplate sentence tacked onto 30 real
+        paragraphs is a ~3% short-paragraph ratio -- nowhere near the
+        whole-document threshold below -- but it's exactly the shape a
+        real footer leak takes, so it needs its own check rather than
+        being averaged away by a document-wide ratio.
+      - Whole-document ratio: catches the OPPOSITE shape, an article
+        that's mostly link-list/nav-shaped rather than prose throughout
+        (a related-content widget, a nav dump) -- too diffuse for the
+        edge check above to catch, since there's no single "the"
+        boilerplate line, the whole thing reads that way.
+    """
+    words = text.split()
+    if len(words) < MIN_WORDS_FOR_TRUST:
+        return True
+
+    paragraphs = [p for p in text.split("\n") if p.strip()]
+    if not paragraphs:
+        return False
+
+    edge_paragraphs = [paragraphs[0]]
+    if len(paragraphs) > 1:
+        edge_paragraphs.append(paragraphs[-1])
+    if any(len(p.split()) <= SHORT_PARAGRAPH_WORD_LIMIT for p in edge_paragraphs):
+        return True
+
+    if len(paragraphs) >= MIN_PARAGRAPHS_FOR_LINE_SHAPE_CHECK:
+        short_count = sum(1 for p in paragraphs if len(p.split()) <= SHORT_PARAGRAPH_WORD_LIMIT)
+        if short_count / len(paragraphs) >= SHORT_PARAGRAPH_RATIO_THRESHOLD:
+            return True
+
+    return False
+
+
+# --------------------------------------------------------------------------
+# Track 2: batching -- see module docstring. BATCH_SIZE is a request-count
+# lever, not a token-budget one (TPM headroom is not the binding
+# constraint here); kept modest anyway to limit one failed batch call's
+# blast radius and keep the model's structured multi-item output
+# reliable.
+# --------------------------------------------------------------------------
+BATCH_SIZE = 15
+
+_BATCH_DETECTION_SYSTEM_PROMPT = """You audit MULTIPLE scraped news articles at once for leftover site chrome that a text extractor failed to strip out: cookie-consent notices, related-article link lists, bylines/credits, editorial-policy footers, social-share prompts, promotional blurbs, navigation labels, or any other fragment that is not part of an article's actual prose.
+
+You will receive a JSON array of objects, each with "id" (an integer) and "text" (one article's sample text). Treat each article independently -- do not let one article's content influence what counts as boilerplate in another.
+
+Only flag text that is clearly NOT part of the article it came from. Do not flag real sentences just because they're short. Do not flag anything you are not reasonably confident is boilerplate.
+
+Respond with ONLY a JSON array, one object per input article, IN THE SAME ORDER as the input, each with exactly two keys:
+  "id": the matching input id
+  "candidates": an array of {"fragment": ..., "reason": ...} objects (fragment copied verbatim from that article's text), or an empty array if nothing was flagged
+
+Example response: [{"id": 0, "candidates": []}, {"id": 1, "candidates": [{"fragment": "Follow us on social media", "reason": "social-share prompt"}]}]"""
+
+_boilerplate_caller = None  # constructed lazily, right after
+                            # get_gemini_client/rotate_gemini_key/
+                            # mark_gemini_key_exhausted/gemini_key_count
+                            # are defined below -- see
+                            # _get_boilerplate_caller()
+
+_pending_batch = []  # list of {"output_dir", "url", "text"} dicts queued
+                     # by queue_boilerplate_check(), flushed either when
+                     # it hits BATCH_SIZE or by an explicit
+                     # flush_boilerplate_queue() call at the end of a run.
 
 
 def reset_quota_flag():
     """Call at the start of each top-level run (run_auto/run_url_mode)
     before any scraping begins, so a previous run's rate-limit trip
     doesn't silently carry over into a fresh one in the same process."""
-    global _quota_exhausted
-    _quota_exhausted = False
+    global _pending_batch
+    _get_boilerplate_caller().reset()
+    _pending_batch = []  # a previous (possibly interrupted) run's
+                         # not-yet-flushed items shouldn't bleed into a
+                         # fresh run's batch
     _key_pool.reset()
 
 
@@ -264,107 +397,162 @@ def gemini_key_count():
     return _key_pool.key_count()
 
 
-def _parse_candidates(raw_response_text):
-    """Strips ```json fences if the model added any despite JSON mode
-    being requested, then parses. Returns [] (not a raise) on anything
-    malformed -- a bad LLM response should never take down a scrape
-    that's otherwise working fine."""
+def _get_boilerplate_caller():
+    """Lazily builds this module's GeminiRetryCaller -- deferred (rather
+    than built at module import time) purely so it's defined after the
+    key-pool functions it closes over, without needing to reorder this
+    file around a forward reference. Cached after first call, same
+    lazy-singleton shape as get_gemini_client()'s own client cache."""
+    global _boilerplate_caller
+    if _boilerplate_caller is None:
+        _boilerplate_caller = GeminiRetryCaller(
+            label="boilerplate detection",
+            get_client=get_gemini_client,
+            rotate_key=rotate_gemini_key,
+            mark_exhausted=mark_gemini_key_exhausted,
+            key_count=gemini_key_count,
+            max_retries=MAX_RETRIES,
+            initial_backoff_seconds=INITIAL_BACKOFF_SECONDS,
+            fallback_note="The rest of the scrape keeps going normally, "
+                           "just without this check.",
+        )
+    return _boilerplate_caller
+
+
+def _call_gemini_with_retry(sample, system_prompt=_DETECTION_SYSTEM_PROMPT, max_output_tokens=1000):
+    return _get_boilerplate_caller().call(DETECTION_MODEL, sample, system_prompt, max_output_tokens)
+
+
+def _sample_for_detection(text):
+    """Shared head+tail slicing used by both a single article's slot in a
+    batch payload -- boilerplate in practice clusters at the start
+    (bylines, consent banners) or end (footers, related-content, promo
+    blocks) of the text, so this covers the cases actually seen so far;
+    revisit if a real leak turns out to be buried in the middle of a
+    long article."""
+    if len(text) > MAX_HEAD_CHARS + MAX_TAIL_CHARS:
+        return text[:MAX_HEAD_CHARS] + "\n\n[... article middle omitted ...]\n\n" + text[-MAX_TAIL_CHARS:]
+    return text
+
+
+def _parse_batch_response(raw_response_text, expected_count):
+    """Returns a list of candidate-lists, length == expected_count,
+    positionally aligned by the "id" each input article was given.
+    Anything malformed -- unparseable JSON, a missing/out-of-range id,
+    a non-list "candidates" field -- defaults that SLOT to [] rather
+    than raising or (worse) misaligning one article's candidates onto
+    another's log entry. A misattributed candidate would get logged
+    under the wrong url/domain in boilerplate_candidates.json, which is
+    worse than a silently missed one, since review works off exactly
+    that domain/url pairing."""
     cleaned = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw_response_text.strip())
+    results = [[] for _ in range(expected_count)]
     try:
         data = json.loads(cleaned)
     except json.JSONDecodeError:
-        return []
+        return results
     if not isinstance(data, list):
-        return []
-    candidates = []
+        return results
+
     for item in data:
-        if isinstance(item, dict) and item.get("fragment"):
-            candidates.append({
-                "fragment": str(item["fragment"]).strip(),
-                "reason": str(item.get("reason", "")).strip(),
-            })
-    return candidates
-
-
-def _call_gemini_with_retry(sample):
-    global _quota_exhausted
-    if _quota_exhausted:
-        return None
-
-    from google.genai import types
-    config = types.GenerateContentConfig(
-        system_instruction=_DETECTION_SYSTEM_PROMPT,
-        max_output_tokens=1000,
-        response_mime_type="application/json",  # JSON mode: skips needing
-                                                  # to ask nicely for no
-                                                  # markdown fences
-    )
-    while True:
-        client = get_gemini_client()  # current active key -- may have
-                                        # changed since the last call if a
-                                        # rotation happened partway
-                                        # through this run
-        for attempt in range(MAX_RETRIES):
-            try:
-                return client.models.generate_content(
-                    model=DETECTION_MODEL,
-                    contents=sample,
-                    config=config,
-                )
-            except Exception as e:
-                msg = str(e)
-                is_rate_limit = "429" in msg or "RESOURCE_EXHAUSTED" in msg
-                if is_rate_limit and attempt < MAX_RETRIES - 1:
-                    time.sleep(INITIAL_BACKOFF_SECONDS * (2 ** attempt))
-                    continue
-                if not is_rate_limit:
-                    return None  # not a rate-limit issue -- rotating keys wouldn't help
-                break  # persistent 429s on THIS key after MAX_RETRIES
-
-        # Current key looks genuinely exhausted (not just a transient
-        # blip -- that's what the retry loop above already absorbed).
-        # Mark it and try the next key in the pool before giving up.
-        mark_gemini_key_exhausted()
-        if gemini_key_count() > 1 and rotate_gemini_key():
-            print("\n🔁 Gemini key exhausted -- rotating to the next key in "
-                  "GEMINI_API_KEYS and retrying...")
+        if not isinstance(item, dict):
             continue
+        idx = item.get("id")
+        if not isinstance(idx, int) or not (0 <= idx < expected_count):
+            continue
+        candidates = item.get("candidates")
+        if not isinstance(candidates, list):
+            continue
+        parsed = [
+            {"fragment": str(c["fragment"]).strip(), "reason": str(c.get("reason", "")).strip()}
+            for c in candidates if isinstance(c, dict) and c.get("fragment")
+        ]
+        results[idx] = parsed
+    return results
 
-        _quota_exhausted = True
-        which = "the only configured key" if gemini_key_count() == 1 else "every configured key"
-        print(f"\n⚠️  Gemini API rate/quota limit hit repeatedly on {which} -- "
-              "pausing boilerplate detection for the rest of this run "
-              "(free-tier RPM/RPD caps are easy to hit on a big batch). The "
-              "rest of the scrape keeps going normally, just without this "
-              "check.")
-        return None
 
+def _flush_batch_sync(batch_items):
+    """Blocking call -- run via asyncio.to_thread(). Sends ONE Gemini
+    request covering every queued article at once; this is the actual
+    RPM relief described in the module docstring's Track 2. Returns a
+    list of (output_dir, url, candidates) tuples, same order as
+    batch_items -- a failed call (quota exhausted, malformed response)
+    fails safe to "nothing flagged" for every article in the batch
+    rather than raising, same discipline the old single-article path
+    used."""
+    get_gemini_client()  # fail fast if package/key(s) missing
 
-def detect_boilerplate_candidates_sync(text):
-    """Blocking call -- run via asyncio.to_thread() from the async scrape
-    path so it doesn't stall the Playwright event loop. Returns a list of
-    {"fragment", "reason"} dicts, possibly empty. Never raises for
-    ordinary API hiccups -- returns [] and lets the caller decide whether
-    to note the failure, since a detection failure is not a reason to
-    fail the whole scrape."""
-    get_gemini_client()  # fail fast if package/key(s) missing, before doing any slicing work
-    if len(text) > MAX_HEAD_CHARS + MAX_TAIL_CHARS:
-        sample = text[:MAX_HEAD_CHARS] + "\n\n[... article middle omitted ...]\n\n" + text[-MAX_TAIL_CHARS:]
-    else:
-        sample = text
+    payload = json.dumps(
+        [{"id": i, "text": _sample_for_detection(item["text"])} for i, item in enumerate(batch_items)],
+        ensure_ascii=False,
+    )
+    # Not a token-budget lever (see BATCH_SIZE's comment) -- just enough
+    # headroom that a batch of flagged fragments across many articles
+    # doesn't get cut off mid-response.
+    max_tokens = min(8000, 200 + 300 * len(batch_items))
 
-    response = _call_gemini_with_retry(sample)
+    response = _call_gemini_with_retry(payload, system_prompt=_BATCH_DETECTION_SYSTEM_PROMPT,
+                                        max_output_tokens=max_tokens)
     if response is None:
-        return []
+        return [(item["output_dir"], item["url"], []) for item in batch_items]
+
     raw = getattr(response, "text", None)
     if not raw:
-        return []
-    return _parse_candidates(raw)
+        return [(item["output_dir"], item["url"], []) for item in batch_items]
+
+    parsed = _parse_batch_response(raw, len(batch_items))
+    return [(batch_items[i]["output_dir"], batch_items[i]["url"], parsed[i]) for i in range(len(batch_items))]
 
 
-async def detect_boilerplate_candidates(text):
-    import asyncio
-    return await asyncio.to_thread(detect_boilerplate_candidates_sync, text)
+async def queue_boilerplate_check(output_dir, url, text):
+    """Call this once per saved article instead of hitting Gemini
+    directly. Decides for itself (is_suspicious()) whether the article
+    is even worth an LLM pass -- a no-op, returning immediately, for
+    articles that look like normal well-formed prose. That's most
+    scraped articles, which is where most of the call-volume reduction
+    actually comes from (see the module docstring's Track 1).
+
+    Suspicious articles queue up instead of triggering an immediate
+    call, and this function auto-flushes (one batched Gemini request
+    covering everything queued so far) once BATCH_SIZE has piled up, so
+    a long auto-discover run doesn't hold an ever-growing queue in
+    memory or delay ALL its candidate logging to the very end.
+
+    The caller (run_auto / run_url_mode) still needs one final
+    flush_boilerplate_queue() call after its scraping loop ends, to
+    catch whatever's left in the queue below BATCH_SIZE -- see that
+    function's docstring."""
+    if not is_suspicious(text):
+        return
+    _pending_batch.append({"output_dir": output_dir, "url": url, "text": text})
+    if len(_pending_batch) >= BATCH_SIZE:
+        await flush_boilerplate_queue()
+
+
+async def flush_boilerplate_queue():
+    """Sends whatever's currently queued as one batched Gemini request,
+    logs each article's candidates via log_boilerplate_candidates(), and
+    prints a summary line for any article that got something flagged.
+
+    Safe to call with an empty queue (no-op) -- callers can
+    unconditionally call this at the end of a run without checking queue
+    length themselves first. This MUST be called once at the end of
+    run_auto/run_url_mode's scraping loop (when --detect-boilerplate is
+    on) -- otherwise a run whose suspicious-article count doesn't
+    happen to be an exact multiple of BATCH_SIZE will silently lose
+    whatever's left sitting in the queue when the process exits."""
+    global _pending_batch
+    if not _pending_batch:
+        return
+    batch_items = _pending_batch
+    _pending_batch = []
+
+    results = await asyncio.to_thread(_flush_batch_sync, batch_items)
+    for out_dir, url, candidates in results:
+        added = log_boilerplate_candidates(out_dir, url, candidates)
+        if added:
+            tqdm.write(f"   🔍 LLM flagged {added} possible boilerplate fragment(s) "
+                       f"({url}) → boilerplate_candidates.json")
 
 
 def log_boilerplate_candidates(output_dir, url, candidates):

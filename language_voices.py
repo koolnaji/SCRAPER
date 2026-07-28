@@ -40,9 +40,9 @@ independently trip anyway within a call or two of each other).
 
 import re
 import json
-import time
 import asyncio
 
+from gemini_retry import GeminiRetryCaller
 from boilerplate_detector import (
     get_gemini_client,
     DETECTION_MODEL,
@@ -64,15 +64,43 @@ MAX_SAMPLE_CHARS = 2000
 
 _LANGUAGE_SYSTEM_PROMPT = """You identify the language of a piece of news-article text.
 
-Respond with ONLY a JSON object with exactly one key:
+Respond with ONLY a JSON object with exactly two keys:
   "language_code": the two-letter ISO 639-1 code for the DOMINANT language of the text (lowercase, e.g. "is", "en", "cy")
+  "confidence": a number from 0.0 to 1.0 for how confident you are that this code is correct. Use a LOW number (below 0.5) if the text is short, mixed-language, boilerplate-heavy, or otherwise ambiguous -- do not default to a high number out of habit.
 
-If the text is genuinely mixed-language with no single dominant language, pick whichever language makes up more of the text. If you cannot identify the language at all, use "unknown" as the value.
+If the text is genuinely mixed-language with no single dominant language, pick whichever language makes up more of the text and lower your confidence accordingly. If you cannot identify the language at all, use "unknown" as the language_code and 0.0 as the confidence.
 
-Example response: {"language_code": "is"}"""
+Example response: {"language_code": "is", "confidence": 0.9}"""
 
-_lang_quota_exhausted = False  # separate from boilerplate_detector's own
-                                # flag by design -- see module docstring.
+# Gemini isn't a calibrated LID specialist the way the local judges are
+# (see language_judges.py's own comment on why its base weight sits
+# between CLD3 and the two fastText models), and its self-reported
+# confidence field above is a best-effort ask, not a guaranteed-accurate
+# probability. This floor is what a genuinely unremarkable, "yeah
+# probably" call should land at -- used whenever the model's own
+# confidence value is missing, malformed, or (as LLM self-reported
+# confidence tends to run) implausibly pinned at the extremes. Previously
+# this path just hardcoded 1.0 for every tiebreak vote regardless of how
+# sure the model actually sounded, which meant Gemini's real contribution
+# to a tiebreak (weight x confidence) was always its full 0.9 weight --
+# quietly outweighing local judges who report their genuine, usually-
+# sub-1.0 confidence on the same vote.
+GEMINI_CONFIDENCE_FALLBACK = 0.6
+
+_language_caller = GeminiRetryCaller(
+    label="the LLM language voice",
+    get_client=get_gemini_client,
+    rotate_key=rotate_gemini_key,
+    mark_exhausted=mark_gemini_key_exhausted,
+    key_count=gemini_key_count,
+    max_retries=MAX_RETRIES,
+    initial_backoff_seconds=INITIAL_BACKOFF_SECONDS,
+    fallback_note="Language detection keeps going on the local lingua "
+                   "voice alone, just without a second opinion.",
+)  # separate instance (own quota_exhausted flag) from
+   # boilerplate_detector.py's caller by design -- see module docstring.
+   # Both still route through the SAME underlying key pool via the
+   # get_client/rotate_key/etc. callables above.
 
 
 def reset_language_quota_flag():
@@ -81,12 +109,11 @@ def reset_language_quota_flag():
     reset_quota_flag() -- so a previous run's rate-limit trip doesn't
     silently carry over into a fresh one in the same interactive-menu
     session. Also resets the SHARED key-exhaustion pool (via
-    reset_gemini_key_pool(), not reset_quota_flag() itself, since this
+    reset_gemini_key_pool(), not just this caller's own flag, since this
     flag and boilerplate's are intentionally independent -- see module
     docstring) so a previous run's rotated-through keys get another
     chance too."""
-    global _lang_quota_exhausted
-    _lang_quota_exhausted = False
+    _language_caller.reset()
     reset_gemini_key_pool()
 
 
@@ -95,7 +122,13 @@ def _parse_language_response(raw_response_text):
     being requested, then parses and validates. Returns None (not a
     raise) on anything malformed or on the model's own "unknown" --
     either way the API voice has nothing usable to contribute, and the
-    caller falls back to the local voice alone."""
+    caller falls back to the local voice alone.
+
+    Returns (code, confidence) on success. confidence falls back to
+    GEMINI_CONFIDENCE_FALLBACK if the field is missing, non-numeric, or
+    outside [0.0, 1.0] -- a malformed confidence field shouldn't sink an
+    otherwise-valid language code, but it also shouldn't be silently
+    trusted as 1.0 just because it round-tripped through JSON."""
     cleaned = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw_response_text.strip())
     try:
         data = json.loads(cleaned)
@@ -106,70 +139,33 @@ def _parse_language_response(raw_response_text):
     code = str(data.get("language_code", "")).strip().lower()
     if not re.fullmatch(r"[a-z]{2}", code):
         return None  # covers "unknown" (3+ letters) and anything malformed
-    return code
+
+    raw_confidence = data.get("confidence")
+    try:
+        confidence = float(raw_confidence)
+        if not (0.0 <= confidence <= 1.0):
+            confidence = GEMINI_CONFIDENCE_FALLBACK
+    except (TypeError, ValueError):
+        confidence = GEMINI_CONFIDENCE_FALLBACK
+
+    return code, confidence
 
 
 def _call_gemini_with_retry(sample):
-    global _lang_quota_exhausted
-    if _lang_quota_exhausted:
-        return None
-
-    from google.genai import types
-    config = types.GenerateContentConfig(
-        system_instruction=_LANGUAGE_SYSTEM_PROMPT,
-        max_output_tokens=50,  # a JSON object holding a 2-letter code
-                                 # needs almost nothing -- keep the free-
-                                 # tier token burn negligible per call
-        response_mime_type="application/json",
+    return _language_caller.call(
+        DETECTION_MODEL, sample, _LANGUAGE_SYSTEM_PROMPT, max_output_tokens=50,
     )
-    while True:
-        client = get_gemini_client()  # current active key -- may have
-                                        # changed since the last call if a
-                                        # rotation happened partway
-                                        # through this run (possibly
-                                        # triggered by the OTHER voice,
-                                        # boilerplate detection -- they
-                                        # share one pool)
-        for attempt in range(MAX_RETRIES):
-            try:
-                return client.models.generate_content(
-                    model=DETECTION_MODEL,
-                    contents=sample,
-                    config=config,
-                )
-            except Exception as e:
-                msg = str(e)
-                is_rate_limit = "429" in msg or "RESOURCE_EXHAUSTED" in msg
-                if is_rate_limit and attempt < MAX_RETRIES - 1:
-                    time.sleep(INITIAL_BACKOFF_SECONDS * (2 ** attempt))
-                    continue
-                if not is_rate_limit:
-                    return None  # not a rate-limit issue -- rotating keys wouldn't help
-                break  # persistent 429s on THIS key after MAX_RETRIES
-
-        mark_gemini_key_exhausted()
-        if gemini_key_count() > 1 and rotate_gemini_key():
-            print("\n🔁 Gemini key exhausted -- rotating to the next key in "
-                  "GEMINI_API_KEYS and retrying (language voice)...")
-            continue
-
-        _lang_quota_exhausted = True
-        which = "the only configured key" if gemini_key_count() == 1 else "every configured key"
-        print(f"\n⚠️  Gemini API rate/quota limit hit repeatedly on {which} -- "
-              "pausing the LLM language voice for the rest of this run. "
-              "Language detection keeps going on the local lingua voice "
-              "alone, just without a second opinion.")
-        return None
 
 
 def detect_language_llm_sync(text):
     """Blocking call -- run via asyncio.to_thread() from the async scrape
     path so it doesn't stall the Playwright event loop. Returns a
-    lowercase 2-letter ISO 639-1 code, or None if the API voice couldn't
-    produce one (quota exhausted, transient failure, or the model itself
-    said "unknown") -- None means "no second opinion available", not
-    "the article has no language", so callers should fall back to the
-    local voice rather than treating None as a real answer."""
+    (lowercase 2-letter ISO 639-1 code, confidence) tuple, or None if the
+    API voice couldn't produce one (quota exhausted, transient failure,
+    or the model itself said "unknown") -- None means "no second opinion
+    available", not "the article has no language", so callers should
+    fall back to the local voice rather than treating None as a real
+    answer."""
     get_gemini_client()  # fail fast if package/key(s) missing
     sample = text[:MAX_SAMPLE_CHARS]
     response = _call_gemini_with_retry(sample)
@@ -182,8 +178,9 @@ def detect_language_llm_sync(text):
 
 
 async def detect_language_llm(text):
-    """Async wrapper. Swallows get_gemini_client()'s RuntimeError (missing
-    google-genai package or GEMINI_API_KEY) instead of letting it
+    """Async wrapper. Returns a (code, confidence) tuple or None -- see
+    detect_language_llm_sync(). Swallows get_gemini_client()'s RuntimeError
+    (missing google-genai package or GEMINI_API_KEY) instead of letting it
     propagate -- this is only ever called as a tiebreaker for the subset
     of articles language_judges.py's local panel couldn't already
     resolve, so a missing/misconfigured Gemini client should just mean

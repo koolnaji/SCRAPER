@@ -118,6 +118,19 @@ MIN_CORROBORATING_JUDGES = 2
 
 DISPUTES_FILENAME = "language_disputes.json"
 
+# The four local judges that ALWAYS get a chance to vote in judge_language()
+# -- used at logging time to work out who abstained, since verdict.votes
+# only ever contains judges that DID vote (abstaining judges are already
+# excluded there by design -- see judge_language()'s own docstring). This
+# list is what makes "nobody voted" and "everybody voted but disagreed"
+# distinguishable in the dispute log itself, not just in the live verdict
+# object -- previously the log only showed who DID weigh in, so a domain
+# where (say) CLD3 silently never manages to vote at all looked identical
+# in the log to one where CLD3 votes every time but keeps losing. Those
+# are different problems needing different fixes, and only one of them is
+# visible without this.
+LOCAL_JUDGE_NAMES = ("glotlid", "openlid", "cld3", "lingua")
+
 JudgeVote = namedtuple("JudgeVote", ["code", "confidence"])
 
 LanguageVerdict = namedtuple("LanguageVerdict", [
@@ -369,7 +382,7 @@ def judge_language(text, lingua_detector):
     )
 
 
-def reconcile_gemini_tiebreak(verdict, gemini_code):
+def reconcile_gemini_tiebreak(verdict, gemini_result):
     """Only called by the caller when verdict.disputed is True AND the
     --detect-language-llm flag is on -- this is the whole point of
     demoting Gemini to a tiebreaker: it's invoked ONLY for the subset of
@@ -377,9 +390,12 @@ def reconcile_gemini_tiebreak(verdict, gemini_code):
     per-article, which is the actual fix for the RPM-pressure problem
     this module was built to address, not just a smaller version of it.
 
-    gemini_code: whatever language_voices.py's detect_language_llm()
-    returned (already lowercase 2-letter, or None if the API voice had
-    nothing to say -- quota exhausted, transient failure, etc).
+    gemini_result: whatever language_voices.py's detect_language_llm()
+    returned -- a (code, confidence) tuple (code already lowercase
+    2-letter; confidence self-reported by the model, falling back to
+    GEMINI_CONFIDENCE_FALLBACK if missing/invalid -- see that module),
+    or None if the API voice had nothing to say (quota exhausted,
+    transient failure, etc).
 
     Returns a new LanguageVerdict with Gemini's vote folded in and the
     dispute re-resolved. If Gemini's vote is enough to push a code over
@@ -387,19 +403,28 @@ def reconcile_gemini_tiebreak(verdict, gemini_code):
     agrees with nobody, or the panel was split three-plus ways), it
     stays disputed -- adding one more opinion doesn't manufacture
     consensus that isn't there, on purpose."""
-    if gemini_code is None:
+    if gemini_result is None:
         return verdict  # API voice had nothing to add -- unchanged
 
+    gemini_code, gemini_confidence = gemini_result
     votes = dict(verdict.votes)
-    votes["gemini"] = JudgeVote(gemini_code, 1.0)  # Gemini doesn't return a
-                                                     # calibrated confidence
-                                                     # today, so it votes at
-                                                     # full strength -- its
-                                                     # WEIGHT (0.9) is what
-                                                     # keeps it from
-                                                     # outvoting two
-                                                     # corroborating local
-                                                     # judges on its own
+    votes["gemini"] = JudgeVote(gemini_code, gemini_confidence)  # weighted by
+                                                     # the model's OWN
+                                                     # self-reported
+                                                     # confidence, same as
+                                                     # every local judge --
+                                                     # previously this
+                                                     # hardcoded 1.0, so
+                                                     # Gemini always voted
+                                                     # at its full 0.9
+                                                     # weight regardless of
+                                                     # how sure it actually
+                                                     # was, quietly
+                                                     # outweighing local
+                                                     # judges reporting
+                                                     # their genuine,
+                                                     # usually-sub-1.0
+                                                     # confidence
     winner_code, winner_share, disputed = _resolve_votes(votes)
     return LanguageVerdict(
         code=None if disputed else winner_code,
@@ -420,6 +445,16 @@ def log_language_dispute(output_dir, url, verdict):
     renamed since this is no longer a two-voice disagreement log, it's a
     full panel breakdown. Deduped by URL, same as before.
 
+    Now also records WHICH local judges abstained (voted for nothing),
+    not just which ones voted -- "abstained" and "voted but lost" are
+    different problems (a judge that never loads vs. a judge that loads
+    fine but keeps disagreeing), and previously only the second was
+    visible in this log. gemini isn't included in LOCAL_JUDGE_NAMES since
+    it's only ever invoked conditionally (the --detect-language-llm flag,
+    and only as a tiebreak) -- its absence from votes doesn't mean
+    "abstained" the same way a local judge's absence does, so it's left
+    out of the abstained list rather than logged misleadingly.
+
     Returns True if a new entry was added, False if this URL was already
     logged."""
     path = os.path.join(output_dir, DISPUTES_FILENAME)
@@ -437,10 +472,13 @@ def log_language_dispute(output_dir, url, verdict):
     if any(isinstance(e, dict) and e.get("url") == url for e in existing):
         return False
 
+    abstained = [name for name in LOCAL_JUDGE_NAMES if name not in verdict.votes]
+
     existing.append({
         "url": url,
         "domain": urlparse(url).netloc.replace("www.", ""),
         "votes": {name: {"code": v.code, "confidence": v.confidence} for name, v in verdict.votes.items()},
+        "abstained": abstained,
         "best_guess": verdict.winner_code,
         "best_guess_share": round(verdict.winner_share, 3),
         "logged_at": datetime.now(timezone.utc).isoformat(),

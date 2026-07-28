@@ -1,0 +1,45 @@
+# News scraper -- requirements
+# ==============================
+# Install with:
+#   pip install -r requirements.txt
+#   playwright install chromium   # separate step -- pip alone won't fetch the browser binary
+#
+# Windows-specific notes (see README for the full story on each):
+#   - fasttext-wheel, NOT fasttext -- the original PyPI "fasttext" package
+#     has no prebuilt Windows wheel and needs a C++ compiler to build from
+#     source. fasttext-wheel is a maintained drop-in with real Windows
+#     wheels, same `import fasttext`.
+#   - numpy is pinned below 2.0 -- fasttext-wheel (and some of its own
+#     transitive deps) still call the old `np.array(obj, copy=False)`
+#     convention, which NumPy 2.0 turned into a hard error instead of the
+#     old "avoid a copy if possible" behavior. Unpin once every dependency
+#     in this chain has caught up to NumPy 2.0's semantics -- not yet, as
+#     of this file being written.
+#   - gcld3 is NOT listed here on purpose. It also has no Windows wheel
+#     and needs a C++ compiler (Visual Studio Build Tools) to build.
+#     language_judges.py's CLD3 judge is designed to abstain gracefully
+#     if it's missing -- the panel still works with 3 of 4 local judges.
+#     Only add it if you've got a working C++ toolchain and specifically
+#     want CLD3 in the panel:
+#       gcld3
+
+# --- Scraping / extraction ---
+playwright
+trafilatura
+
+# --- Language identification (local judges) ---
+lingua-language-detector
+fasttext-wheel        # NOT fasttext -- see note above
+huggingface_hub       # pulls GlotLID/OpenLID model.bin files on first use
+
+# --- Lemmatization (optional -- only used if --lemmatize is passed) ---
+stanza
+
+# --- Gemini (boilerplate detection + LLM language tiebreak, both opt-in flags) ---
+google-genai
+
+# --- UI / progress ---
+tqdm
+
+# --- Pinned for Windows compatibility -- see note above ---
+numpy<2

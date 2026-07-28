@@ -539,8 +539,8 @@ async def detect_language(text, use_gemini_tiebreak=False):
         return (verdict.code if verdict.code else UNKNOWN_LANG_FOLDER), None
 
     if use_gemini_tiebreak:
-        gemini_code = await detect_language_llm(text)
-        verdict = reconcile_gemini_tiebreak(verdict, gemini_code)
+        gemini_result = await detect_language_llm(text)  # (code, confidence) or None
+        verdict = reconcile_gemini_tiebreak(verdict, gemini_result)
         if not verdict.disputed:
             return verdict.code, None
 
@@ -579,8 +579,8 @@ import boilerplate_patterns  # module object itself, not just its contents --
                                # boilerplate_review.run_review() needs
                                # .__file__ to know which file on disk to edit
 from boilerplate_detector import (
-    detect_boilerplate_candidates,
-    log_boilerplate_candidates,
+    queue_boilerplate_check,
+    flush_boilerplate_queue,
     get_gemini_client,
     reset_quota_flag,
 )
@@ -986,12 +986,18 @@ async def scrape_one(page, url, output_dir, lemmatize_lang, seen_hashes, index, 
         # persistent record building up across runs), except this one is
         # a review queue rather than a reusable cache: entries don't get
         # consumed, they sit there until you've looked at them.
+        #
+        # Doesn't call Gemini directly -- queue_boilerplate_check() only
+        # queues articles its own suspicion filter thinks are worth a
+        # look, and sends them in batches rather than one call per
+        # article; see boilerplate_detector.py's module docstring. This
+        # means candidates from a SUSPICIOUS article might not get
+        # logged/printed until a later article in this same run triggers
+        # the batch to flush (or the run ends and flush_boilerplate_queue()
+        # catches the remainder) -- output no longer arrives strictly
+        # per-article the way it used to.
         if detect_boilerplate:
-            candidates = await detect_boilerplate_candidates(text)
-            added = log_boilerplate_candidates(output_dir, url, candidates)
-            if added:
-                tqdm.write(f"   🔍 LLM flagged {added} possible boilerplate fragment(s) "
-                           f"→ boilerplate_candidates.json")
+            await queue_boilerplate_check(output_dir, url, text)
 
         seen_hashes.add(raw_hash)
         append_to_manifest(output_dir, normalize_url(url), raw_hash)
@@ -1041,6 +1047,15 @@ async def scrape_batch(page, urls, output_dir, lemmatize_lang, seen_hashes, dela
             tqdm.write(f"\n💥 {len(still_failed)} URLs could not be scraped after retry:")
             for u in still_failed:
                 tqdm.write(f"   {u}")
+
+    if detect_boilerplate:
+        # Catches whatever's left in the queue below BATCH_SIZE -- without
+        # this, a run whose suspicious-article count isn't an exact
+        # multiple of BATCH_SIZE would silently lose that remainder's
+        # candidates when the process exits. Safe to call unconditionally
+        # (no-op on an empty queue), but only worth calling at all when
+        # this run actually turned the feature on.
+        await flush_boilerplate_queue()
 
     return saved
 
@@ -1319,8 +1334,10 @@ def interactive_menu():
             elif step == "boilerplate":
                 state["detect_boilerplate"] = _prompt_yes_no(
                     "\nUse Gemini's free API tier to flag possible leftover boilerplate for review? "
-                    "(one API call per saved article, rate-limited on the free tier, "
-                    "requires GEMINI_API_KEY; candidates are only logged, never auto-applied)",
+                    "(only articles that look suspiciously short/list-shaped are checked, and those "
+                    "are sent in batches rather than one call per article, to go easier on the free "
+                    "tier's per-minute request cap; requires GEMINI_API_KEY; candidates are only "
+                    "logged, never auto-applied)",
                     default=False,
                 )
                 step = "language_llm"
