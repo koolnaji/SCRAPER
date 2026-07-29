@@ -1444,9 +1444,10 @@ def main():
                               "(logs candidates to boilerplate_candidates.json, never auto-applied; "
                               "requires GEMINI_API_KEY)")
     auto_p.add_argument("--detect-language-llm", action="store_true",
-                         help="Get a second language-ID opinion from Gemini alongside the built-in lingua "
-                              "detector (same free tier/key as --detect-boilerplate); on disagreement, "
-                              "Gemini's answer is used and the split is logged to language_disagreements.json")
+                         help="Get a second language-ID opinion from Gemini, used ONLY as a tiebreaker when the local "
+                              "4-judge panel (GlotLID, OpenLID-v3, CLD3, lingua) genuinely disagrees on an article -- "
+                              "not called for every article (same free tier/key as --detect-boilerplate). Still-disputed "
+                              "articles are filed under the 'disputed' language folder and logged to language_disputes.json")
 
     url_p = sub.add_parser("url", help="Scrape one or more specific article URLs directly")
     url_p.add_argument("urls", nargs="+", help="One or more direct article URLs")
@@ -1458,9 +1459,10 @@ def main():
                              "(logs candidates to boilerplate_candidates.json, never auto-applied; "
                              "requires GEMINI_API_KEY)")
     url_p.add_argument("--detect-language-llm", action="store_true",
-                        help="Get a second language-ID opinion from Gemini alongside the built-in lingua "
-                             "detector (same free tier/key as --detect-boilerplate); on disagreement, "
-                             "Gemini's answer is used and the split is logged to language_disagreements.json")
+                        help="Get a second language-ID opinion from Gemini, used ONLY as a tiebreaker when the local "
+                             "4-judge panel (GlotLID, OpenLID-v3, CLD3, lingua) genuinely disagrees on an article -- "
+                             "not called for every article (same free tier/key as --detect-boilerplate). Still-disputed "
+                             "articles are filed under the 'disputed' language folder and logged to language_disputes.json")
 
     clear_p = sub.add_parser("clear", help="Delete downloaded article .txt files (raw + lemmatized) and reset scraped_urls.txt")
     clear_p.add_argument("--output-dir", default=DEFAULT_OUTPUT)

@@ -332,8 +332,20 @@ def _resolve_votes(votes):
     winner_code, winner_weight = max(weighted.items(), key=lambda kv: kv[1])
     winner_share = (winner_weight / total_weight) if total_weight > 0 else 0.0
 
+    # BUGFIX: this used to check len(votes) -- the total number of judges
+    # who voted for ANYTHING -- against MIN_CORROBORATING_JUDGES, not how
+    # many judges actually backed the WINNING code. That let a genuinely
+    # single-judge answer sail through as "corroborated": e.g. glotlid
+    # votes "nl" at weight*confidence 0.9, lingua votes "sv" at 0.54 --
+    # "nl" clears the 55% share threshold (0.9/1.44 = 62.5%) and
+    # len(votes)==2 clears MIN_CORROBORATING_JUDGES, so it gets accepted
+    # as consensus even though exactly one judge ever said "nl". Counting
+    # corroboration correctly means checking how many judges actually
+    # voted for winner_code, not how many judges showed up at all.
+    corroborating_judges = sum(1 for v in votes.values() if v.code == winner_code)
+
     disputed = (
-        len(votes) < MIN_CORROBORATING_JUDGES
+        corroborating_judges < MIN_CORROBORATING_JUDGES
         or winner_share < CONSENSUS_SHARE_THRESHOLD
     )
     return winner_code, winner_share, disputed
