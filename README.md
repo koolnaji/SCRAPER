@@ -22,7 +22,7 @@ local, offline 3-judge language-ID panel.
 
 ```bash
 
-pip install playwright trafilatura lingua-language-detector tqdm
+pip install -r requirements.txt
 
 playwright install chromium
 
@@ -30,29 +30,25 @@ playwright install chromium
 
 
 
-Optional, only if you want lemmatized output:
+`requirements.txt` already includes Playwright, trafilatura, lingua,
+
+fasttext-wheel (Windows-friendly; use `fasttext` on Linux/macOS if you
+
+prefer), huggingface\_hub, stanza, google-genai, and tqdm.
+
+
+
+\*\*Gemini API key\*\* (only if you use `--detect-boilerplate` or
+
+`--detect-language-llm`):
 
 
 
 ```bash
 
-pip install stanza
+export GEMINI\_API\_KEY=...   # free key: https://aistudio.google.com/apikey
 
-```
-
-
-
-Optional, only if you use `--detect-boilerplate` or `--detect-language-llm`:
-
-
-
-```bash
-
-pip install google-genai
-
-export GEMINI\_API\_KEY=...   # free key, no credit card required: https://aistudio.google.com/apikey
-
-\# or, to rotate across multiple free-tier keys when one hits its rate limit:
+\# or rotate across multiple free-tier keys:
 
 export GEMINI\_API\_KEYS="key1,key2,key3"
 
@@ -60,31 +56,17 @@ export GEMINI\_API\_KEYS="key1,key2,key3"
 
 
 
-Optional, only for the local language-ID panel's non-`lingua` judges (the
-
-scraper still runs fine without these — the panel just falls back to
-
-whichever judges \*are\* available, see \*\*Language detection\*\* below):
+On Windows CMD use `set GEMINI\_API\_KEY=...` instead of `export`.
 
 
 
-```bash
+\*\*Language-ID models:\*\* the first time GlotLID or OpenLID-v3 runs, each
 
-\# Windows: use fasttext-wheel (prebuilt). Linux/macOS: fasttext is fine.
+downloads a \~1–2GB model from HuggingFace (one-time; needs internet).
 
-pip install fasttext-wheel huggingface\_hub
+The scraper still runs if those packages are missing — the panel falls
 
-\# or: pip install fasttext huggingface\_hub
-
-```
-
-
-
-`fasttext` / `fasttext-wheel` + `huggingface\_hub` are needed for the GlotLID
-
-and OpenLID-v3 judges (each downloads a \~1–2GB model from HuggingFace the
-
-first time it's used — needs internet access for that one-time download).
+back to whichever judges are available (see \*\*Language detection\*\*).
 
 
 
@@ -206,7 +188,7 @@ python icelandic\_text\_extractor.py delete --output-dir ./news\_corpus
 
 | Flag | Default | Applies to | Description |
 
-|---|---|---|---|
+| --- | --- | --- | --- |
 
 | `--output-dir DIR` | `./news\_corpus` | all modes | Where `.txt` files and the manifest are saved |
 
@@ -270,6 +252,8 @@ from the source site, so a mixed-language listing page sorts itself
 
 correctly on its own. Text lands in one of three places:
 
+
+
 \- a real language folder (`is/`, `en/`, etc.) when the panel reaches consensus,
 
 \- `unknown/` when no judge had anything usable to say at all,
@@ -290,13 +274,15 @@ corpus-wide), one line per article:
 
 ```
 
-https://example.com/news/some-slug	<content-hash>
+https://example.com/news/some-slug    <content-hash>
 
 ```
 
 
 
 This powers two dedup checks on every run:
+
+
 
 \- \*\*URL dedup\*\* — same URL won't be re-scraped.
 
@@ -323,6 +309,8 @@ silently blocking a re-scrape forever.
 
 
 Links found on a listing page are kept as candidate articles if they:
+
+
 
 \- stay on the same domain,
 
@@ -475,6 +463,8 @@ logs candidates to `boilerplate\_candidates.json` for review.
 
 
 To keep this within the free tier's tight per-minute request cap:
+
+
 
 \- \*\*Suspicion filter\*\* — most normal-length, well-formed articles skip the
 
