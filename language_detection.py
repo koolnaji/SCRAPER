@@ -21,8 +21,8 @@ a rare tiebreaker: it's only ever called for articles the local panel
 itself can't resolve, which is the actual fix for the RPM-pressure
 problem raised earlier, not just a workaround for it.
 
-Why four judges instead of one
--------------------------------
+Why three judges instead of one
+--------------------------------
 GlotLID (cis-lmu/glotlid on HuggingFace) is the anchor: a fastText model
 covering 2000+ ISO 639-3 languages, including everything on this
 project's radar (Icelandic, Dutch, Danish, Swedish, Norwegian, Welsh,
@@ -32,29 +32,25 @@ underlying library doesn't support at ANY size list). It's the reason
 this module exists at all.
 
 But one judge, however broad its coverage, is still one opinion. The
-other three each cover a real, different failure mode GlotLID alone
+other two each cover a real, different failure mode GlotLID alone
 doesn't:
 
   - OpenLID-v3 (HPLT/OpenLID-v3) -- GlotLID's own paper reports it wins
     on recall but OpenLID wins on PRECISION and false-positive rate, and
     recommends ensembling the two. Where GlotLID casts the widest net,
     OpenLID is the one likelier to catch a GlotLID false positive.
-  - CLD3 (Google, via gcld3) -- a genuinely different model architecture
-    (neural net, not fastText n-grams) from the other two, so its errors
-    are less likely to be CORRELATED with GlotLID/OpenLID's. Verified by
-    hand: correctly identifies nl/da/sv/cy/ga with high confidence, and
-    -- crucially -- on Greenlandic text it doesn't just get the answer
-    wrong, it flags is_reliable=False on its (wrong) guess. That
-    reliability flag is used directly as this judge's abstain gate below,
-    not just an FYI field.
   - lingua -- already in this codebase, already proven (see
     icelandic_text_extractor.py's own comment on the langdetect
     Icelandic/Norwegian mix-up) to be solid WITHIN its closed candidate
-    list. Kept as a fourth, cheap opinion; extended here to include
-    Dutch and Irish (both are in lingua's underlying 75-language set,
-    just weren't in this project's 10-language build list before).
+    list. Kept as a cheap corroborating opinion; extended here to include
+    Dutch, Irish, Italian, and Portuguese (all in lingua's underlying
+    75-language set).
 
-None of the four is trusted alone. See judge_language()'s docstring for
+(CLD3 / gcld3 was previously a fourth judge. Removed: no reliable Windows
+wheel, and with only three strong local signals the panel is quieter
+without sacrificing coverage from GlotLID + OpenLID.)
+
+None of the three is trusted alone. See judge_language()'s docstring for
 how the panel's votes turn into a decision vs. a dispute.
 
 PART 2 -- THE GEMINI TIEBREAKER VOICE (was language_voices.py):
@@ -74,13 +70,12 @@ request ceiling (RPM binds far sooner than TPM does for a call this
 small -- a couple hundred tokens per sample against a 5 RPM free-tier
 cap, well before the 250K TPM cap is anywhere close).
 
-Current design: language_judges.py runs a panel of four LOCAL, offline
-judges (GlotLID, OpenLID-v3, CLD3, lingua) first. Gemini, via this
-module, is only ever invoked for the subset of articles that panel
-couldn't already resolve on its own -- see judge_language() and
-reconcile_gemini_tiebreak() in language_judges.py. That's what actually
-fixes the RPM pressure, not just spreads the same per-article call rate
-out with retries/backoff.
+Current design: language_judges.py runs a panel of three LOCAL, offline
+judges (GlotLID, OpenLID-v3, lingua) first. Gemini, via this module, is
+only ever invoked for the subset of articles that panel couldn't already
+resolve on its own -- see judge_language() and reconcile_gemini_tiebreak()
+in language_judges.py. That's what actually fixes the RPM pressure, not
+just spreads the same per-article call rate out with retries/backoff.
 
 Opt-in only (--detect-language-llm / the interactive-menu prompt), off
 by default -- same reasoning as boilerplate_detector.py: worth paying
@@ -138,6 +133,83 @@ LANGUAGE_OVERRIDES = {
         "listing_urls": {
             "en": ["https://www.bbc.com/news"],
             "cy": ["https://www.bbc.com/cymrufyw"],
+        },
+    },
+    "apnews.com": {
+        "expected_language": "en",
+        "language_lock": True,
+        "listing_urls": {
+            "en": ["https://apnews.com/"],
+        },
+    },
+    "tagesschau.de": {
+        "expected_language": "de",
+        "language_lock": True,
+        "listing_urls": {
+            "de": ["https://www.tagesschau.de/"],
+        },
+    },
+    "dw.com": {
+        "expected_language": "de",
+        "language_lock": True,
+        "listing_urls": {
+            "de": ["https://www.dw.com/de/"],
+        },
+    },
+    "nrk.no": {
+        "expected_language": "nb",
+        "language_lock": True,
+        "listing_urls": {
+            "nb": ["https://www.nrk.no/", "https://www.nrk.no/nyheter/"],
+        },
+    },
+    "nos.nl": {
+        "expected_language": "nl",
+        "language_lock": True,
+        "listing_urls": {
+            "nl": ["https://nos.nl/", "https://nos.nl/nieuws"],
+        },
+    },
+    "ansa.it": {
+        "expected_language": "it",
+        "language_lock": True,
+        "listing_urls": {
+            "it": ["https://www.ansa.it/"],
+        },
+    },
+    "rtve.es": {
+        "expected_language": "es",
+        "language_lock": True,
+        "listing_urls": {
+            "es": ["https://www.rtve.es/noticias/"],
+        },
+    },
+    "rtp.pt": {
+        "expected_language": "pt",
+        "language_lock": True,
+        "listing_urls": {
+            "pt": ["https://www.rtp.pt/noticias/"],
+        },
+    },
+    "svt.se": {
+        "expected_language": "sv",
+        "language_lock": True,
+        "listing_urls": {
+            "sv": ["https://www.svt.se/", "https://www.svt.se/nyheter/"],
+        },
+    },
+    "lefigaro.fr": {
+        "expected_language": "fr",
+        "language_lock": True,
+        "listing_urls": {
+            "fr": ["https://www.lefigaro.fr/"],
+        },
+    },
+    "france24.com": {
+        "expected_language": "fr",
+        "language_lock": True,
+        "listing_urls": {
+            "fr": ["https://www.france24.com/fr/"],
         },
     },
 }
@@ -261,19 +333,15 @@ def resolve_listing_urls_for_languages(codes):
 JUDGE_WEIGHTS = {
     "glotlid": 1.0,   # broadest coverage, best recall per its own paper
     "openlid": 1.0,   # best precision/FPR -- meant to pair with glotlid
-    "cld3":    0.8,   # different architecture = independent error profile,
-                       # but narrower (~107 language) coverage than the
-                       # two fastText models above
     "lingua":  0.6,   # cheapest/oldest signal here, closed candidate
                        # list, documented history of confusing close
                        # Nordic-language pairs -- kept for corroboration,
                        # not as a primary voice
     "gemini":  0.9,   # tiebreak-only (see reconcile_gemini_tiebreak
                        # below) -- a strong general model but not a
-                       # calibrated LID specialist, so it sits between
-                       # cld3 and the two dedicated fastText judges
+                       # calibrated LID specialist; sits between lingua
+                       # and the two dedicated fastText judges
     "site_hint": 0.5, # a domain-level language PRIOR (see
-                       # icelandic_text_extractor.py's
                        # get_expected_language() -- e.g. ruv.is is never
                        # anything but Icelandic), NOT a judge that
                        # actually looked at this specific text. Weighted
@@ -310,11 +378,6 @@ SITE_HINT_CONFIDENCE = 0.65
 # each model's confidence distribution actually looks).
 GLOTLID_THRESHOLD = 0.3
 OPENLID_THRESHOLD = 0.5
-# CLD3 ships its OWN calibrated reliability flag (is_reliable) -- verified
-# by hand to correctly come back False on a Greenlandic sample it
-# (wrongly) guessed as Somali. Used as the primary gate; this probability
-# floor is just a belt-and-suspenders backstop.
-CLD3_PROBABILITY_FLOOR = 0.5
 
 # --------------------------------------------------------------------------
 # Ensemble resolution thresholds
@@ -323,7 +386,7 @@ CLD3_PROBABILITY_FLOOR = 0.5
 # means the winning code has to hold more than half the total weight
 # among judges who actually voted, not just more than any single
 # runner-up. This is deliberately independent of HOW the weight got
-# there: a landslide among 2 judges and a narrow win among 4 both have
+# there: a landslide among 2 judges and a narrow win among 3 both have
 # to clear the same bar. Weighting decides WHO's ahead; this threshold
 # decides whether "ahead" is convincing enough to act on. A weighted
 # vote with a weak margin is still a real disagreement underneath --
@@ -340,18 +403,14 @@ MIN_CORROBORATING_JUDGES = 2
 
 DISPUTES_FILENAME = "language_disputes.json"
 
-# The four local judges that ALWAYS get a chance to vote in judge_language()
+# The three local judges that ALWAYS get a chance to vote in judge_language()
 # -- used at logging time to work out who abstained, since verdict.votes
 # only ever contains judges that DID vote (abstaining judges are already
 # excluded there by design -- see judge_language()'s own docstring). This
 # list is what makes "nobody voted" and "everybody voted but disagreed"
 # distinguishable in the dispute log itself, not just in the live verdict
-# object -- previously the log only showed who DID weigh in, so a domain
-# where (say) CLD3 silently never manages to vote at all looked identical
-# in the log to one where CLD3 votes every time but keeps losing. Those
-# are different problems needing different fixes, and only one of them is
-# visible without this.
-LOCAL_JUDGE_NAMES = ("glotlid", "openlid", "cld3", "lingua")
+# object.
+LOCAL_JUDGE_NAMES = ("glotlid", "openlid", "lingua")
 
 JudgeVote = namedtuple("JudgeVote", ["code", "confidence"])
 
@@ -369,7 +428,7 @@ LanguageVerdict = namedtuple("LanguageVerdict", [
 # GlotLID and OpenLID both label with three-letter ISO codes plus a
 # script tag (e.g. "nld_Latn", "kal_Latn") -- this project's folder
 # layout and Stanza lemmatizer calls expect the shorter two-letter codes
-# lingua and CLD3 already speak. This table is a closed list on purpose,
+# lingua already speaks. This table is a closed list on purpose,
 # same philosophy as _LINGUA_LANGUAGES in the main script: covers what's
 # actually been scraped so far, extend it here first if a new language
 # starts showing up. Anything NOT in this table falls back to keeping
@@ -381,6 +440,7 @@ ISO_639_3_TO_1 = {
     "isl": "is", "eng": "en", "cym": "cy", "nob": "nb", "nno": "nn",
     "swe": "sv", "dan": "da", "deu": "de", "fra": "fr", "spa": "es",
     "nld": "nl", "gle": "ga", "kal": "kl",
+    "ita": "it", "por": "pt",
 }
 
 
@@ -397,7 +457,7 @@ def _normalize_iso639_3_label(raw_label):
 # load (no internet for the model download, missing package, etc.) never
 # takes down the others -- same "losing one voice doesn't take down the
 # other" principle language_voices.py already established for the old
-# two-voice system, just extended to four judges instead of two.
+# two-voice system, just extended to three judges instead of two.
 # --------------------------------------------------------------------------
 
 _glotlid_model = None
@@ -481,40 +541,6 @@ def judge_openlid(text):
     return JudgeVote(_normalize_iso639_3_label(labels[0]), float(probs[0]))
 
 
-_cld3_detector = None
-_cld3_load_failed = False
-
-
-def _load_cld3():
-    global _cld3_detector, _cld3_load_failed
-    if _cld3_detector is not None or _cld3_load_failed:
-        return _cld3_detector
-    try:
-        import gcld3
-        _cld3_detector = gcld3.NNetLanguageIdentifier(min_num_bytes=0, max_num_bytes=2000)
-    except Exception as e:
-        _cld3_load_failed = True
-        print(f"⚠️  CLD3 unavailable ({e}) -- this judge will abstain for "
-              "the rest of the run. (pip install gcld3 -- needs a C++ "
-              "compiler and the protobuf compiler at install time.)")
-    return _cld3_detector
-
-
-def judge_cld3(text):
-    detector = _load_cld3()
-    if detector is None:
-        return None
-    result = detector.FindLanguage(text=text[:2000])
-    # is_reliable is CLD3's own calibrated confidence gate, verified by
-    # hand to correctly flip False on a Greenlandic sample it otherwise
-    # would have silently misfiled as Somali -- this is the judge's real
-    # abstain signal; the probability floor below is just a backstop for
-    # whatever is_reliable doesn't catch.
-    if not result.is_reliable or result.probability < CLD3_PROBABILITY_FLOOR:
-        return None
-    return JudgeVote(result.language.lower(), float(result.probability))
-
-
 def judge_lingua(text, lingua_detector):
     """lingua_detector is passed in rather than built here -- it's already
     built once at import time in icelandic_text_extractor.py (adding
@@ -562,7 +588,7 @@ def _resolve_votes(votes):
 
 
 def judge_language(text, lingua_detector, site_hint_code=None):
-    """Runs all four local judges (Gemini is NOT called here -- see
+    """Runs all three local judges (Gemini is NOT called here -- see
     reconcile_gemini_tiebreak below) and resolves their votes.
 
     site_hint_code: optional ISO 639-1 code from the site's own
@@ -584,7 +610,7 @@ def judge_language(text, lingua_detector, site_hint_code=None):
     Returns a LanguageVerdict. Three outcomes:
 
       1. No judge had anything to say at all (every model failed to
-         load, or the text was too short/garbled for all four) ->
+         load, or the text was too short/garbled for all three) ->
          code=None, disputed=False. This is the old UNKNOWN_LANG_FOLDER
          case, distinct from a genuine dispute: nobody voted, so there's
          nothing to disagree ABOUT.
@@ -601,7 +627,6 @@ def judge_language(text, lingua_detector, site_hint_code=None):
     for judge_name, vote in (
         ("glotlid", judge_glotlid(text)),
         ("openlid", judge_openlid(text)),
-        ("cld3", judge_cld3(text)),
         ("lingua", judge_lingua(text, lingua_detector)),
     ):
         if vote is not None:
@@ -753,7 +778,7 @@ Example response: {"language_code": "is", "confidence": 0.9}"""
 
 # Gemini isn't a calibrated LID specialist the way the local judges are
 # (see language_judges.py's own comment on why its base weight sits
-# between CLD3 and the two fastText models), and its self-reported
+# between lingua and the two fastText models), and its self-reported
 # confidence field above is a best-effort ask, not a guaranteed-accurate
 # probability. This floor is what a genuinely unremarkable, "yeah
 # probably" call should land at -- used whenever the model's own

@@ -87,6 +87,10 @@ try:
         # against real samples before trusting them, same caution this
         # comment already asks for on any newly-added language.
         Language.DUTCH, Language.IRISH,
+        # Italian + Portuguese added 2026-07-31 when ANSA / RTP overrides
+        # were introduced -- without these, lingua had no candidate for
+        # either language and routinely fell back to English.
+        Language.ITALIAN, Language.PORTUGUESE,
     ]
     _lingua_detector = LanguageDetectorBuilder.from_languages(*_LINGUA_LANGUAGES).build()
     LANGDETECT_AVAILABLE = True
@@ -100,7 +104,7 @@ DEFAULT_OUTPUT = os.path.join(os.getcwd(), "news_corpus")
 MANIFEST_NAME = "scraped_urls.txt"
 UNKNOWN_LANG_FOLDER = "unknown"
 # Distinct from UNKNOWN_LANG_FOLDER: "unknown" means no judge in the
-# language_detection.py panel had anything to say at all (all four failed
+# language_detection.py panel had anything to say at all (all three failed
 # to load, or the text was too short/garbled for every one of them).
 # "disputed" means the OPPOSITE problem -- judges DID vote, they just
 # didn't agree enough to trust. Keeping these separate matters for
@@ -286,7 +290,31 @@ SITE_OVERRIDES = {
         "exclude_selectors": ["[class*='PagePromo-byline']"],
         "listing_path_prefixes": ["/article/"],
     },
-        "ansa.it": {
+    "tagesschau.de": {
+        # inspect_selectors.py 2026-07-31 on a CSD/Mauritania investigativ piece:
+        #   main          -> 29 paras, 7630 chars, nav/social + taglist
+        #   article       -> 26 paras, 7564 chars (~99% of main), same suspects
+        # Prefer article (tighter). Hand-narrowed tag match to .taglist only.
+        "article_selector": "article",
+        "exclude_selectors": ["nav", ".taglist"],
+        "listing_path_prefixes": None,
+    },
+    "nrk.no": {
+        # inspect_selectors.py 2026-07-31 on a Meta/Microsoft quarterly piece:
+        #   article / [role='main']  -> 50 paras, 5986 chars, related-sidebar junk
+        #   .article-body            -> 49 paras, 5812 chars (97 %), clean
+        "article_selector": ".article-body",
+        "exclude_selectors": [],
+        "listing_path_prefixes": None,
+    },
+    "nos.nl": {
+        # inspect_selectors.py 2026-07-31 on a Bolle Jos / Belgian court piece:
+        #   main -> 11 paras, 2591 chars, clean. No other candidates matched.
+        "article_selector": "main",
+        "exclude_selectors": [],
+        "listing_path_prefixes": None,
+    },
+    "ansa.it": {
         # inspect_selectors.py 2026-07-31 on a Delmastro chat / Giunta piece:
         #   article                    -> 12 paras, 4898 chars, share + related + tags
         #   [itemprop='articleBody']   -> 12 paras, 4898 chars (100 %), clean
@@ -316,12 +344,23 @@ SITE_OVERRIDES = {
         "listing_path_prefixes": None,
     },
     "svt.se": {
-        # inspect_selectors.py 2026-07-31 on a live "senaste nytt om val 2026" feed:
-        #   main -> 59 paras, 7829 chars, footer + share buttons
-        #   article matched nothing (live-blog template)
-        # Re-check against a normal long-form article later.
-        "article_selector": "main",
-        "exclude_selectors": ["footer", "[class*='share']"],
+        # inspect_selectors.py 2026-07-31 on a normal long-form local piece
+        # (brand-pa-bat-i-vattern): article / main article / main all identical
+        # (8 paras, 876 chars); only suspect is the ArticleFooter. Earlier
+        # live-blog sample had no <article> and needed main + share excludes;
+        # ordinary articles use <article>, so prefer that + footer only.
+        # Existing END_OF_ARTICLE_MARKERS ("Så arbetar vi") still covers the
+        # editorial-policy footer on other templates.
+        "article_selector": "article",
+        "exclude_selectors": ["footer"],
+        "listing_path_prefixes": None,
+    },
+    "dw.com": {
+        # inspect_selectors.py 2026-07-31 on a CSD Berlin / youth-judges piece:
+        #   article -> 19 paras, 6798 chars; footer (author/feedback) + ad slots
+        # No clean alternative. Hand-narrowed advert matches to .advertisement.
+        "article_selector": "article",
+        "exclude_selectors": ["footer", ".advertisement"],
         "listing_path_prefixes": None,
     },
 }
@@ -628,14 +667,14 @@ def lemmatize(text, lang_code):
 # --------------------------------------------------------------------------
 
 async def detect_language(text, url, use_gemini_tiebreak=False):
-    """Runs the full language_detection.py panel (GlotLID, OpenLID-v3, CLD3,
+    """Runs the full language_detection.py panel (GlotLID, OpenLID-v3,
     lingua) on an article's RAW extracted text -- called before any
     --lemmatize step, since a lemmatized token stream is a worse
     detection input than natural text, same reasoning as before.
 
-    The panel itself is synchronous (fastText/gcld3/lingua are all
+    The panel itself is synchronous (fastText/lingua are all
     blocking C++/native calls) so it's run via asyncio.to_thread() to
-    avoid stalling the Playwright event loop while four models run --
+    avoid stalling the Playwright event loop while three models run --
     same reason detect_language_llm_sync() gets the to_thread()
     treatment in language_detection.py.
 
@@ -1567,7 +1606,7 @@ def interactive_menu():
             elif step == "language_llm":
                 state["detect_language_llm_flag"] = _prompt_yes_no(
                     "\nAllow Gemini to break ties when the local language-ID panel "
-                    "(GlotLID, OpenLID-v3, CLD3, lingua) genuinely disagrees on an "
+                    "(GlotLID, OpenLID-v3, lingua) genuinely disagrees on an "
                     "article? Only called for the disputed subset, not every article "
                     "-- same free tier/key as boilerplate detection above.",
                     default=False,

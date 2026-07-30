@@ -15,13 +15,7 @@
 #     old "avoid a copy if possible" behavior. Unpin once every dependency
 #     in this chain has caught up to NumPy 2.0's semantics -- not yet, as
 #     of this file being written.
-#   - gcld3 is NOT listed here on purpose. It also has no Windows wheel
-#     and needs a C++ compiler (Visual Studio Build Tools) to build.
-#     language_judges.py's CLD3 judge is designed to abstain gracefully
-#     if it's missing -- the panel still works with 3 of 4 local judges.
-#     Only add it if you've got a working C++ toolchain and specifically
-#     want CLD3 in the panel:
-#       gcld3
+#   - CLD3/gcld3 was removed from the panel (3 judges: GlotLID, OpenLID, lingua).
 
 # --- Scraping / extraction ---
 playwright
