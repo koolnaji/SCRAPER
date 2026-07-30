@@ -80,7 +80,7 @@ try:
         Language.BOKMAL, Language.NYNORSK, Language.SWEDISH, Language.DANISH,
         Language.GERMAN, Language.FRENCH, Language.SPANISH,
         # Added when lingua got folded into the multi-judge panel
-        # (language_judges.py) -- both are in lingua's own 75-language
+        # (language_detection.py) -- both are in lingua's own 75-language
         # set, they just weren't in THIS project's build list before,
         # meaning NOS.nl (Dutch) articles were being locally misread as
         # whichever of the above lingua considered closest. Spot-checked
@@ -100,14 +100,14 @@ DEFAULT_OUTPUT = os.path.join(os.getcwd(), "news_corpus")
 MANIFEST_NAME = "scraped_urls.txt"
 UNKNOWN_LANG_FOLDER = "unknown"
 # Distinct from UNKNOWN_LANG_FOLDER: "unknown" means no judge in the
-# language_judges.py panel had anything to say at all (all four failed
+# language_detection.py panel had anything to say at all (all four failed
 # to load, or the text was too short/garbled for every one of them).
 # "disputed" means the OPPOSITE problem -- judges DID vote, they just
 # didn't agree enough to trust. Keeping these separate matters for
 # review: an "unknown" article is a coverage/extraction problem, a
 # "disputed" one is a genuine language-identification ambiguity (or a
 # language outside every judge's real competence, like Greenlandic
-# sometimes will be -- see language_judges.py's module docstring).
+# sometimes will be -- see language_detection.py's module docstring).
 DISPUTED_LANG_FOLDER = "disputed"
 
 # Path fragments that almost never indicate an actual article, across
@@ -146,6 +146,17 @@ STATIC_EXTENSIONS = (
 #                            hyphens nor a long digit run, so the generic
 #                            heuristic would silently discover zero BBC
 #                            articles from a listing page without this).
+#
+# This table is extraction/discovery data ONLY (boilerplate detection's
+# concern) -- language-related overrides (expected_language,
+# language_lock, listing_urls) live in language_detection.py's own
+# LANGUAGE_OVERRIDES table instead, keyed by the same domains but kept
+# separate on purpose: boilerplate detection and language detection are
+# two independent features that happen to both key off domain, and
+# folding both features' data into one dict here would mean a language-
+# only change lives in, and is reasoned about via, a file named after a
+# different feature. See LANGUAGE_OVERRIDES's own header comment in
+# language_detection.py for the language-side field list.
 #
 # Every entry below is evidence-backed from a real inspect_selectors.py
 # run against a live article on that domain, not guessed -- see each
@@ -210,12 +221,121 @@ SITE_OVERRIDES = {
         # the fix for that -- path PREFIX match instead.
         "listing_path_prefixes": ["/news/articles/", "/cymrufyw/erthyglau/"],
     },
+    "lefigaro.fr": {
+        # inspect_selectors.py on a real Le Figaro article: 'main' (8276
+        # chars, 4 suspect groups) vs 'article'/'main article' (both
+        # identical, 4643 chars, 2 suspect groups). The tool's own
+        # clean-alt check only considers a fallback candidate if it has
+        # ZERO suspects, so it defaulted to keeping 'main' + excluding --
+        # overridden by hand to 'article' instead, since 'article's
+        # suspect set (share, tag) is a strict subset of 'main's (nav,
+        # share x3, related, tag). The ~3.6k char gap between them is
+        # almost certainly the breadcrumb nav and the "Sur le même
+        # thème" related-content carousel (other headlines/summaries),
+        # not real article prose -- so 'article' loses nothing and
+        # entirely avoids ever needing the unnarrowed [class*='related']
+        # wildcard the 'main' path would've required (the same shape of
+        # risk as independent.co.uk's Taboola widget leaking
+        # off-language content into the corpus).
+        "article_selector": "article",
+        "exclude_selectors": ["[class*='share']", "[class*='tag']"],
+        "listing_path_prefixes": None,  # not checked by this tool -- verify against a listing page separately
+    },
+    "france24.com": {
+        # inspect_selectors.py on a real France24 article: 'main' and
+        # "[role='main']" returned identical text (18 paragraphs, 4849
+        # chars) -- same node, not two real candidates -- and there's no
+        # <article> tag on this template at all, so unlike lefigaro.fr
+        # there was no tighter alternative to weigh against 'main'.
+        # 24 separate "[class*='tag']" matches looked alarming at first
+        # but were checked by hand one-by-one: suggested-keyword chips
+        # (gtm-add-suggested-tag), category/recirc badges some of them
+        # empty (m-master-tag), and the "Mots-clés associés" keyword
+        # footer (t-content__tags) -- three unrelated class families all
+        # containing "tag", none of them sentence-shaped, so the
+        # wildcard's inability to narrow to one token reflects genuine
+        # heterogeneity rather than a risk of eating real prose.
+        # [class*='share'] was a single unambiguous "Partager" button.
+        # CAVEAT (not yet confirmed against a real scrape): several
+        # m-master-tag matches were empty, suggesting a recirc/"also
+        # happening" module lives inside 'main' -- if a future sample
+        # shows stray unrelated-topic sentences in
+        # boilerplate_candidates.json for this domain, re-run the
+        # inspector, since that module might carry real headline text
+        # on some articles without a tag-ish class to catch it.
+        "article_selector": "main",
+        "exclude_selectors": ["nav", "[class*='share']", "[class*='tag']"],
+        "listing_path_prefixes": None,  # not checked by this tool -- verify against a listing page separately
+    },
+    "apnews.com": {
+        # inspect_selectors.py 2026-07-30 on a Fauci/Senate article:
+        #   main                 -> 46 paras, 11037 chars, 4 suspect groups
+        #                           (Author-socialLinks, jw-related video
+        #                           shelf, jw accessibility chrome,
+        #                           StoryPage byline + PagePromo read-time)
+        #   [class*='RichText']  -> 38 paras, 9320 chars (~84% of main),
+        #                           only PagePromo-byline chips ("5 MIN READ")
+        # Tool auto-kept main (RichText not fully clean). Overridden by
+        # hand to RichText -- same call as an earlier AP sample noted in
+        # inspect_selectors.py's CLEAN_ALTERNATIVE_MIN_RATIO comment
+        # (RichText preferred over main when close in size). Narrow
+        # exclude for the promo read-time widgets only; avoid broad
+        # [class*='byline'] which would also hit real author bylines if
+        # a template puts those inside RichText later.
+        "article_selector": "[class*='RichText']",
+        "exclude_selectors": ["[class*='PagePromo-byline']"],
+        "listing_path_prefixes": ["/article/"],
+    },
+        "ansa.it": {
+        # inspect_selectors.py 2026-07-31 on a Delmastro chat / Giunta piece:
+        #   article                    -> 12 paras, 4898 chars, share + related + tags
+        #   [itemprop='articleBody']   -> 12 paras, 4898 chars (100 %), clean
+        "article_selector": "[itemprop='articleBody']",
+        "exclude_selectors": [],
+        "listing_path_prefixes": None,
+    },
+    "rtve.es": {
+        # inspect_selectors.py 2026-07-31 on a forest-management / wildfires piece:
+        #   article / main article -> 24 paras, 8862 chars, only shareBox
+        #   main                   -> same text + extra nav + tag list
+        "article_selector": "article",
+        "exclude_selectors": [".shareBox"],
+        "listing_path_prefixes": None,
+    },
+    "rtp.pt": {
+        # inspect_selectors.py 2026-07-31 on an oil-company solidarity contribution piece:
+        #   main            -> 41 paras, 6752 chars, social + share + ad frames
+        #   .article-body   -> 3 paras, 3874 chars (57 %), clean but below 70 %
+        "article_selector": "main",
+        "exclude_selectors": [
+            "[class*='social_buttons']",
+            "[class*='sharethis']",
+            "[class*='pub-frame']",
+            "[class*='pub-advert']",
+        ],
+        "listing_path_prefixes": None,
+    },
+    "svt.se": {
+        # inspect_selectors.py 2026-07-31 on a live "senaste nytt om val 2026" feed:
+        #   main -> 59 paras, 7829 chars, footer + share buttons
+        #   article matched nothing (live-blog template)
+        # Re-check against a normal long-form article later.
+        "article_selector": "main",
+        "exclude_selectors": ["footer", "[class*='share']"],
+        "listing_path_prefixes": None,
+    },
 }
 
 
 def get_site_override(url):
     domain = urlparse(url).netloc.replace("www.", "").lower()
     return SITE_OVERRIDES.get(domain)
+
+
+# get_expected_language(), is_language_locked(), known_locked_languages(),
+# and resolve_listing_urls_for_languages() used to live here -- moved to
+# language_detection.py alongside LANGUAGE_OVERRIDES, the table they
+# actually read from. Imported below from that module instead.
 
 
 _stanza_pipeline = None  # lazily initialized, only if --lemmatize is used
@@ -446,7 +566,7 @@ def clear_downloaded_articles(output_dir, skip_confirm=False):
 
 def delete_boilerplate_log(output_dir, skip_confirm=False):
     """Deletes boilerplate_candidates.json for output_dir -- the LLM
-    review-queue log from boilerplate_detector.py, not the actual
+    review-queue log from boilerplate.py, not the actual
     boilerplate_patterns.py filter tables. Permanent: make sure any real
     hits have already been promoted into boilerplate_patterns.py by hand
     before clearing this, since nothing here reads it back out.
@@ -507,8 +627,8 @@ def lemmatize(text, lang_code):
 # Language detection (drives per-language output subfolders)
 # --------------------------------------------------------------------------
 
-async def detect_language(text, use_gemini_tiebreak=False):
-    """Runs the full language_judges.py panel (GlotLID, OpenLID-v3, CLD3,
+async def detect_language(text, url, use_gemini_tiebreak=False):
+    """Runs the full language_detection.py panel (GlotLID, OpenLID-v3, CLD3,
     lingua) on an article's RAW extracted text -- called before any
     --lemmatize step, since a lemmatized token stream is a worse
     detection input than natural text, same reasoning as before.
@@ -517,9 +637,21 @@ async def detect_language(text, use_gemini_tiebreak=False):
     blocking C++/native calls) so it's run via asyncio.to_thread() to
     avoid stalling the Playwright event loop while four models run --
     same reason detect_language_llm_sync() gets the to_thread()
-    treatment in language_voices.py.
+    treatment in language_detection.py.
+
+    url is used to look up a site-level language prior via
+    get_expected_language(), AND to check is_language_locked() first --
+    a LOCKED domain (e.g. ruv.is) skips the panel entirely and returns
+    its mapped code directly with zero text inspection; everything else
+    uses get_expected_language() the old way, as a corroborating
+    judge_language() vote, never a sole decider. Both functions and the
+    LANGUAGE_OVERRIDES table they read from live in language_detection.py
+    now, not in this file's SITE_OVERRIDES -- see that table's own
+    header comment for what locking does and doesn't guarantee.
 
     Returns (lang_code, dispute_info_or_None):
+      - Locked domain, path resolves to a code -> (code, None), no panel
+        run at all.
       - Consensus (locally, or after a Gemini tiebreak) -> (code, None).
       - No judge had anything to say -> (UNKNOWN_LANG_FOLDER, None).
       - Still disputed after all available judges (including Gemini, if
@@ -533,7 +665,32 @@ async def detect_language(text, use_gemini_tiebreak=False):
     down (as opposed to just rate-limiting the same per-article call
     rate the old two-voice system made on every article).
     """
-    verdict = await asyncio.to_thread(judge_language, text, _lingua_detector)
+    if is_language_locked(url):
+        locked_code = get_expected_language(url)
+        if locked_code:
+            # No judges touched, no models loaded on their account -- if
+            # a run only ever scrapes locked domains, GlotLID/OpenLID's
+            # lazy loaders in language_detection.py are simply never
+            # called, so their ~3GB combined download/load never happens
+            # at all this run, not just "happens but is fast".
+            return locked_code, None
+        # Locked domain, but this specific path isn't covered by its
+        # expected_language mapping (a dict override missing a
+        # "default", or a new path prefix nobody's added yet). Falling
+        # through to the full panel here on purpose -- language_lock is
+        # a claim that every path is mapped, and this is that claim
+        # turning out false for this one URL. Don't silently guess;
+        # treat it exactly like an unlocked domain instead, and let this
+        # print serve as the signal that language_detection.py's
+        # LANGUAGE_OVERRIDES needs an update.
+        print(f"⚠️  {url} matched a language_lock'd domain but "
+              "get_expected_language() returned nothing for this path -- "
+              "falling back to the full detection panel. The "
+              "language_lock mapping for this domain is missing a case; "
+              "worth fixing in language_detection.py's LANGUAGE_OVERRIDES.")
+
+    site_hint_code = get_expected_language(url)
+    verdict = await asyncio.to_thread(judge_language, text, _lingua_detector, site_hint_code)
 
     if not verdict.disputed:
         return (verdict.code if verdict.code else UNKNOWN_LANG_FOLDER), None
@@ -576,20 +733,27 @@ from boilerplate_patterns import (
     READ_MORE_SUFFIXES,
 )
 import boilerplate_patterns  # module object itself, not just its contents --
-                               # boilerplate_review.run_review() needs
+                               # boilerplate.run_review() needs
                                # .__file__ to know which file on disk to edit
-from boilerplate_detector import (
+from boilerplate import (
     queue_boilerplate_check,
     flush_boilerplate_queue,
     get_gemini_client,
     reset_quota_flag,
+    run_review,
+    offer_end_of_run_boilerplate_review,
 )
-from language_voices import (
+from language_detection import (
     detect_language_llm,
     reset_language_quota_flag,
+    judge_language,
+    reconcile_gemini_tiebreak,
+    log_language_dispute,
+    get_expected_language,
+    is_language_locked,
+    known_locked_languages,
+    resolve_listing_urls_for_languages,
 )
-from language_judges import judge_language, reconcile_gemini_tiebreak, log_language_dispute
-from boilerplate_review import run_review
 from term_ui import rule, wrap, half_width
 import textwrap
 
@@ -937,7 +1101,7 @@ async def scrape_one(page, url, output_dir, lemmatize_lang, seen_hashes, index, 
         # lemmatized token stream (already reduced to dictionary forms,
         # function words flattened) is a worse detection input than
         # natural running text.
-        lang_code, verdict = await detect_language(text, use_gemini_tiebreak=detect_language_llm_flag)
+        lang_code, verdict = await detect_language(text, url, use_gemini_tiebreak=detect_language_llm_flag)
         if verdict is not None:  # only set when lang_code came back DISPUTED_LANG_FOLDER
             logged = log_language_dispute(output_dir, url, verdict)
             if logged:
@@ -990,7 +1154,7 @@ async def scrape_one(page, url, output_dir, lemmatize_lang, seen_hashes, index, 
         # Doesn't call Gemini directly -- queue_boilerplate_check() only
         # queues articles its own suspicion filter thinks are worth a
         # look, and sends them in batches rather than one call per
-        # article; see boilerplate_detector.py's module docstring. This
+        # article; see boilerplate.py's module docstring. This
         # means candidates from a SUSPICIOUS article might not get
         # logged/printed until a later article in this same run triggers
         # the batch to flush (or the run ends and flush_boilerplate_queue()
@@ -1056,6 +1220,16 @@ async def scrape_batch(page, urls, output_dir, lemmatize_lang, seen_hashes, dela
         # (no-op on an empty queue), but only worth calling at all when
         # this run actually turned the feature on.
         await flush_boilerplate_queue()
+
+        # Human gate at the end of every detection-enabled run: review
+        # now (approve → boilerplate_patterns.py), leave in the JSON for
+        # later, or discard. Replaces the previous unconditional
+        # run_review() call so a long scrape doesn't force a full review
+        # session when you only wanted to save candidates. Non-TTY
+        # (scripted) runs skip the prompt and leave the log as-is.
+        # Hooked here because both run_auto() and run_url_mode() funnel
+        # through scrape_batch -- one call site covers both entry points.
+        offer_end_of_run_boilerplate_review(output_dir, boilerplate_patterns)
 
     return saved
 
@@ -1226,6 +1400,39 @@ def _prompt_urls(prompt_text):
     return urls
 
 
+def _prompt_language_codes():
+    """Wizard step for mode 3 ("scrape by language") -- typed codes are
+    resolved straight to a list of listing/section URLs via
+    resolve_listing_urls_for_languages(), so the rest of the pipeline
+    downstream never has to know this run started from language codes
+    instead of pasted URLs; it's still just an "auto" mode run with a
+    given set of listing pages, exactly like mode 1.
+
+    Loops (re-asking, not GoBack) on a malformed code or a code nothing
+    is currently configured for -- those are recoverable typos/mismatches
+    worth a second try in place, unlike a real 'q' which still goes back
+    a step as usual."""
+    print(f"\n{wrap('Which language(s) do you want to scrape? Enter ISO 639-1 codes, comma-separated if more than one (e.g. is, or is,cy).')}")
+    known = known_locked_languages()
+    print(wrap("Currently configured: " +
+               (", ".join(known) if known else "(none yet -- add listing_urls to a locked LANGUAGE_OVERRIDES entry in language_detection.py first)")))
+    while True:
+        line = input("> ").strip().lower()
+        if line == "q":
+            raise GoBack
+        codes = [c.strip() for c in line.split(",") if c.strip()]
+        if not codes or not all(re.fullmatch(r"[a-z]{2}", c) for c in codes):
+            print("   Enter one or more 2-letter codes, comma-separated (e.g. is,cy).")
+            continue
+        urls = resolve_listing_urls_for_languages(codes)
+        if not urls:
+            print(f"   No locked domain currently serves {', '.join(codes)}. "
+                  f"Configured: {', '.join(known) if known else '(none)'}.")
+            continue
+        print(f"   Found {len(urls)} listing page(s) across locked domains for {', '.join(codes)}.")
+        return urls
+
+
 def _prompt_yes_no(question, default=False):
     suffix = "Y/n" if default else "y/N"
     print(wrap(question))
@@ -1281,6 +1488,8 @@ def interactive_menu():
                     "What would you like to do?",
                     [("1", "Auto-discover articles from a listing/section page"),
                      ("2", "Scrape specific article URL(s) directly"),
+                     ("3", "Scrape by language code(s) -- auto-picks known locked "
+                           "outlets' listing pages, no URLs needed"),
                      ("review", f"Review boilerplate_candidates.json for '{output_dir}' and promote approved patterns into boilerplate_patterns.py"),
                      ("clear", f"Delete downloaded article .txt files for '{output_dir}' (raw + lemmatized; resets scraped_urls.txt too)"),
                      ("delete", f"Delete boilerplate_candidates.json for '{output_dir}' (the LLM review log)")],
@@ -1303,8 +1512,20 @@ def interactive_menu():
                     delete_boilerplate_log(output_dir)
                     history.pop()
                     continue
+                if mode_key == "3":
+                    # Still an "auto" run under the hood -- language_codes
+                    # resolves straight to listing-page URLs, same shape
+                    # of input run_auto() already expects from mode 1.
+                    # The distinction only matters up here in the wizard.
+                    state["mode"] = "auto"
+                    step = "language_codes"
+                    continue
                 state["mode"] = "auto" if mode_key == "1" else "url"
                 step = "urls"
+
+            elif step == "language_codes":
+                state["urls"] = _prompt_language_codes()
+                step = "lemmatize_yn"
 
             elif step == "urls":
                 mode = state["mode"]
@@ -1336,8 +1557,9 @@ def interactive_menu():
                     "\nUse Gemini's free API tier to flag possible leftover boilerplate for review? "
                     "(only articles that look suspiciously short/list-shaped are checked, and those "
                     "are sent in batches rather than one call per article, to go easier on the free "
-                    "tier's per-minute request cap; requires GEMINI_API_KEY; candidates are only "
-                    "logged, never auto-applied)",
+                    "tier's per-minute request cap; requires GEMINI_API_KEY; you'll be asked to "
+                    "approve or reject each candidate at the end of THIS run, and nothing is ever "
+                    "auto-applied to boilerplate_patterns.py without that)",
                     default=False,
                 )
                 step = "language_llm"
@@ -1441,13 +1663,13 @@ def main():
     auto_p.add_argument("--delay", type=float, default=1.5, help="Seconds to wait between requests (politeness/rate-limit avoidance, default 1.5)")
     auto_p.add_argument("--detect-boilerplate", action="store_true",
                          help="Use Gemini's free API tier to flag possible leftover boilerplate per article for review "
-                              "(logs candidates to boilerplate_candidates.json, never auto-applied; "
-                              "requires GEMINI_API_KEY)")
+                              "(logs candidates to boilerplate_candidates.json; at the end of THIS run you'll be "
+                              "prompted per candidate to approve or reject before it's promoted into "
+                              "boilerplate_patterns.py -- never auto-applied; requires GEMINI_API_KEY)")
     auto_p.add_argument("--detect-language-llm", action="store_true",
-                         help="Get a second language-ID opinion from Gemini, used ONLY as a tiebreaker when the local "
-                              "4-judge panel (GlotLID, OpenLID-v3, CLD3, lingua) genuinely disagrees on an article -- "
-                              "not called for every article (same free tier/key as --detect-boilerplate). Still-disputed "
-                              "articles are filed under the 'disputed' language folder and logged to language_disputes.json")
+                         help="Get a second language-ID opinion from Gemini alongside the built-in lingua "
+                              "detector (same free tier/key as --detect-boilerplate); on disagreement, "
+                              "Gemini's answer is used and the split is logged to language_disagreements.json")
 
     url_p = sub.add_parser("url", help="Scrape one or more specific article URLs directly")
     url_p.add_argument("urls", nargs="+", help="One or more direct article URLs")
@@ -1456,13 +1678,13 @@ def main():
     url_p.add_argument("--delay", type=float, default=1.5, help="Seconds to wait between requests (politeness/rate-limit avoidance, default 1.5)")
     url_p.add_argument("--detect-boilerplate", action="store_true",
                         help="Use Gemini's free API tier to flag possible leftover boilerplate per article for review "
-                             "(logs candidates to boilerplate_candidates.json, never auto-applied; "
-                             "requires GEMINI_API_KEY)")
+                             "(logs candidates to boilerplate_candidates.json; at the end of THIS run you'll be "
+                             "prompted per candidate to approve or reject before it's promoted into "
+                             "boilerplate_patterns.py -- never auto-applied; requires GEMINI_API_KEY)")
     url_p.add_argument("--detect-language-llm", action="store_true",
-                        help="Get a second language-ID opinion from Gemini, used ONLY as a tiebreaker when the local "
-                             "4-judge panel (GlotLID, OpenLID-v3, CLD3, lingua) genuinely disagrees on an article -- "
-                             "not called for every article (same free tier/key as --detect-boilerplate). Still-disputed "
-                             "articles are filed under the 'disputed' language folder and logged to language_disputes.json")
+                        help="Get a second language-ID opinion from Gemini alongside the built-in lingua "
+                             "detector (same free tier/key as --detect-boilerplate); on disagreement, "
+                             "Gemini's answer is used and the split is logged to language_disagreements.json")
 
     clear_p = sub.add_parser("clear", help="Delete downloaded article .txt files (raw + lemmatized) and reset scraped_urls.txt")
     clear_p.add_argument("--output-dir", default=DEFAULT_OUTPUT)
