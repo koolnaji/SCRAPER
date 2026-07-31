@@ -142,6 +142,22 @@ LANGUAGE_OVERRIDES = {
             "en": ["https://apnews.com/"],
         },
     },
+    "theguardian.com": {
+        # English-only per the SITE_OVERRIDES entry's own sample -- no
+        # non-live-blog counterexample seen. /live/ pages are excluded
+        # from SITE_OVERRIDES entirely (different template, not scraped
+        # via this path), so nothing routes through this lock for them.
+        # Listing URL is /international (Guardian's edition-switcher
+        # default, as opposed to /uk, /us, /au) rather than /world --
+        # neither has been run through actual auto-discovery yet, so
+        # this is still an assumption, not a confirmed-working listing
+        # page the way ruv.is/frettir or bbc.com/news are.
+        "expected_language": "en",
+        "language_lock": True,
+        "listing_urls": {
+            "en": ["https://www.theguardian.com/international"],
+        },
+    },
     "tagesschau.de": {
         "expected_language": "de",
         "language_lock": True,

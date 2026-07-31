@@ -27,6 +27,7 @@ Usage:
     python inspect_selectors.py https://www.bbc.co.uk/cymrufyw/some-article
 """
 import asyncio
+import re
 import sys
 from urllib.parse import urlparse
 
@@ -153,31 +154,80 @@ async def collect_suspects(container_el):
     return found
 
 
+# Below this, a common token is more likely a short utility/layout class
+# ("on", "row", "col") than something specific enough to safely narrow
+# an exclude selector to.
+MIN_TOKEN_CHARS = 4
+
+_HASH_PREFIX_RE = re.compile(r"^(sc|css|emotion|jsx|styled)[-_][a-z0-9]{5,}$", re.IGNORECASE)
+
+
+def _looks_hash_like(token):
+    """Heuristic filter for CSS-in-JS / bundler-generated class tokens
+    (styled-components 'sc-jXbNGH', Emotion 'css-1a2b3c', a CSS-module
+    '<name>_<hash>', etc). These often end up as the LONGEST common
+    token in a class list -- exactly what common_class_token() otherwise
+    treats as "most specific" -- but they're regenerated on every
+    rebuild, so an exclude selector pinned to one is likely to silently
+    stop matching after the site's next redeploy: long and unique isn't
+    the same thing as stable. Not a real hash detector, just two cheap,
+    evidence-motivated signals: a known generator prefix, or a long
+    token with implausibly few vowels for a real human-authored class
+    name (words have vowels; hashes mostly don't)."""
+    if _HASH_PREFIX_RE.match(token):
+        return True
+    if len(token) >= 6 and token.replace("-", "").isalnum():
+        if sum(1 for c in token.lower() if c in "aeiou") <= 1:
+            return True
+    return False
+
+
 def common_class_token(matches):
     """Given the matches for one suspect-selector group, finds a single
     class token shared by EVERY matched element's class list (the same
     thing that made independent.co.uk's many differently-styled Taboola
     widgets excludable with one selector: they all carried
     'trc_related_container' despite nothing else in their class lists
-    matching). Picks the LONGEST common token when more than one
-    qualifies, as a proxy for "most specific, least likely to also
-    match something unrelated" -- not a guarantee, just a reasonable
-    default to review.
+    matching). Among tokens common to every match, prefers the longest
+    one that also clears MIN_TOKEN_CHARS and doesn't look build-hash-
+    generated (see _looks_hash_like()) -- "longest" alone isn't a
+    reliable proxy for "most specific", since a hash is often the
+    longest token in a class list precisely because it's random, not
+    because it's meaningful.
 
-    Returns None if there's no token common to all matches (nothing
-    safe to narrow to), or if there's only one match (a single
+    Returns (token, caveat): token is the chosen class string, or None
+    if nothing common was found, or if there's only one match (a single
     element's own class list isn't "common" to anything -- falls
     through to the broad selector instead, flagged for manual review
-    rather than guessed at)."""
+    rather than guessed at). caveat is a warning string when the
+    fallback had to reach for a token that looked short or hash-like
+    (nothing clean survived the filter), None when the pick looks like
+    a genuine, stable, human-authored class name."""
     if len(matches) < 2:
-        return None
+        return None, None
     token_sets = [set(m["class"].split()) for m in matches if m["class"]]
     if not token_sets:
-        return None
+        return None, None
     common = set.intersection(*token_sets)
     if not common:
-        return None
-    return max(common, key=len)
+        return None, None
+
+    clean = [t for t in common if len(t) >= MIN_TOKEN_CHARS and not _looks_hash_like(t)]
+    if clean:
+        return max(clean, key=len), None
+
+    # Nothing clean survived -- every common token is either too short
+    # to be specific, or looks build-generated. Still return the longest
+    # raw token (some narrowing beats none), but flag it so the printed
+    # recommendation makes the tradeoff visible rather than silently
+    # picking a class that may already be stale by the next scrape.
+    token = max(common, key=len)
+    return token, (
+        f"{token!r} looks build-generated or too short to be a stable "
+        f"class name -- it may stop matching after the site's next "
+        f"redeploy. Worth re-checking with inspect_selectors.py if this "
+        f"domain's extraction ever regresses."
+    )
 
 
 def build_exclude_selectors(suspects):
@@ -195,9 +245,11 @@ def build_exclude_selectors(suspects):
         if tags <= SEMANTIC_TAGS and len(tags) == 1:
             candidate = tags.pop()
         else:
-            token = common_class_token(matches)
+            token, caveat = common_class_token(matches)
             if token:
                 candidate = f"[class*='{token}']"
+                if caveat:
+                    warnings.append(caveat)
             else:
                 candidate = selector
                 warnings.append(

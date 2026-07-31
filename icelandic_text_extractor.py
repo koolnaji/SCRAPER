@@ -290,6 +290,20 @@ SITE_OVERRIDES = {
         "exclude_selectors": ["[class*='PagePromo-byline']"],
         "listing_path_prefixes": ["/article/"],
     },
+    "theguardian.com": {
+        # inspect_selectors.py on an ordinary (non-live) article
+        # ("Japan earthquake stories"): article / main article / main
+        # all identical -- 18 paras, 4684 chars, zero suspects. Picked
+        # 'article' as both the fullest match and the clean one.
+        # NOTE: does NOT cover theguardian.com/*/live/* -- confirmed
+        # different template (main pulls the whole rolling thread,
+        # repeats a per-update share/timestamp footer + pagination nav)
+        # on a live Trump/Fauci/Iran updates page. Deliberately left
+        # unhandled -- live-blog register is out of scope for now.
+        "article_selector": "article",
+        "exclude_selectors": [],
+        "listing_path_prefixes": None,
+    },
     "tagesschau.de": {
         # inspect_selectors.py 2026-07-31 on a CSD/Mauritania investigativ piece:
         #   main          -> 29 paras, 7630 chars, nav/social + taglist
@@ -824,33 +838,54 @@ _READ_MORE_RE = re.compile(
 
 def truncate_at_end_markers(paragraphs):
     """Drops an END_OF_ARTICLE_MARKERS paragraph and everything after it.
+    Returns (paragraphs, truncated) -- truncated is True only when a
+    marker actually fired.
 
-    BUGFIX: this alone isn't enough when the related-content section sits
+    That second return value exists specifically to gate
+    strip_trailing_header_fragment() below (see its own docstring for
+    why): this alone isn't enough when the related-content section sits
     BEFORE the footer instead of after it -- confirmed on a real SVT.se
     article, where a carousel title ("Framsteg runt om i världen") landed
     immediately before the "Så arbetar vi" marker rather than after, and
-    survived as a trailing fragment in the saved article. Handled by
-    strip_trailing_header_fragment() below, applied right after this.
+    survived as a trailing fragment in the saved article. But that's a
+    narrow, specific failure mode -- a stranded fragment left over by
+    THIS truncation -- not a general property of article endings, so the
+    caller should only reach for that follow-up heuristic on the runs
+    where this one actually cut something, not on every article.
     """
     for i, p in enumerate(paragraphs):
         if _END_OF_ARTICLE_RE.search(p.strip()):
-            return paragraphs[:i]
-    return paragraphs
+            return paragraphs[:i], True
+    return paragraphs, False
 
 
 _SENTENCE_END_CHARS = ".!?…”\"'"
 
 
 def strip_trailing_header_fragment(paragraphs):
-    """Trims bare heading-like paragraphs off the END of the list -- short
-    (<=60 chars) and not ending in normal sentence-closing punctuation.
-    Real prose almost always ends with one; a related-content carousel
-    title like "Framsteg runt om i världen" (SVT.se, confirmed) doesn't.
+    """Trims a bare heading-like paragraph off the END of the list --
+    short (<=60 chars) and not ending in normal sentence-closing
+    punctuation. Real prose almost always ends with one; a related-
+    content carousel title like "Framsteg runt om i världen" (SVT.se,
+    confirmed) doesn't.
+
+    CALL THIS ONLY when truncate_at_end_markers() just reported
+    truncated=True. The length+punctuation shape this checks for is
+    common enough in ordinary short final sentences, quotes, or lines
+    ending in something outside _SENTENCE_END_CHARS (a colon, a closing
+    parenthesis, a language's own quote marks) that running it
+    unconditionally on every article -- most of which never had an
+    end-marker fire at all -- would risk trimming real content on the
+    strength of a heuristic that was only ever validated against the one
+    stranded-fragment failure mode it was built for. Gating it behind
+    "did truncation actually happen" is what keeps it reasonable: it
+    only runs when there's an actual reason to suspect a stranded
+    fragment is sitting at the tail.
 
     Only ever trims from the tail, and never trims the list down to
-    nothing, so this can't eat real content -- worst case a short,
-    unpunctuated final sentence stays untouched because trimming would
-    have emptied the list.
+    nothing, so even when it IS called, this can't eat every remaining
+    paragraph -- worst case a short, unpunctuated final line stays
+    untouched because trimming would have emptied the list.
     """
     result = list(paragraphs)
     while len(result) > 1:
@@ -942,8 +977,9 @@ async def extract_via_override(page, override):
         return None
     if not texts:
         return None
-    texts = truncate_at_end_markers(texts)
-    texts = strip_trailing_header_fragment(texts)
+    texts, truncated = truncate_at_end_markers(texts)
+    if truncated:
+        texts = strip_trailing_header_fragment(texts)
     texts = dedupe_consecutive_paragraphs(texts)
     texts = [t for t in texts if not looks_like_boilerplate(t)]
     if not texts:
@@ -1036,8 +1072,9 @@ async def extract_article_text(page, url):
         # rejoin -- same check extract_via_override() and the page-wide
         # fallback below both use, kept in sync across all three paths.
         raw_paragraphs = text.strip().split("\n\n")
-        truncated_paragraphs = truncate_at_end_markers(raw_paragraphs)
-        truncated_paragraphs = strip_trailing_header_fragment(truncated_paragraphs)
+        truncated_paragraphs, was_truncated = truncate_at_end_markers(raw_paragraphs)
+        if was_truncated:
+            truncated_paragraphs = strip_trailing_header_fragment(truncated_paragraphs)
         deduped_paragraphs = dedupe_consecutive_paragraphs(truncated_paragraphs)
         cleaned_paragraphs = [p for p in deduped_paragraphs
                               if not looks_like_boilerplate(p)]
@@ -1086,8 +1123,9 @@ async def extract_article_text(page, url):
         if looks_like_boilerplate(t):
             continue
         texts.append(t)
-    texts = truncate_at_end_markers(texts)
-    texts = strip_trailing_header_fragment(texts)
+    texts, truncated = truncate_at_end_markers(texts)
+    if truncated:
+        texts = strip_trailing_header_fragment(texts)
     texts = dedupe_consecutive_paragraphs(texts)
     fallback_text = "\n\n".join(texts)
     return fallback_text.strip() if fallback_text.strip() else None

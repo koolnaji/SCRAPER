@@ -161,6 +161,9 @@ BOILERPLATE_PATTERNS = [
     # Auto-suggested from boilerplate_candidates.json review (2026-07-30) -- bbc.com, site chrome / video player UI text, 1 example(s).
     # e.g. https://www.bbc.com/news/articles/cwymnvkv2zlo
     '^Automatically\\ selects\\ the\\ best\\ quality\\ available$',
+    # Auto-suggested from boilerplate_candidates.json review (2026-07-31) -- france24.com, error message, 1 example(s).
+    # e.g. https://www.france24.com/fr/vid%C3%A9o/20260730-histoire-fontaines-wallace-embl%C3%A9matiques-d%C3%A9cor-parisien-paris-france-histoire-culture-prime
+    '^Page\\ non\\ trouvée$',
 ]
 
 # --------------------------------------------------------------------------

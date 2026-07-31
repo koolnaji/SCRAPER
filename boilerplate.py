@@ -681,7 +681,15 @@ CANDIDATES_FILENAME = "boilerplate_candidates.json"
 # unrelated fragments -- fall back to per-fragment literal patterns
 # instead of forcing a shaky generalization.
 MIN_PREFIX_CHARS = 8
-MIN_SUFFIX_CHARS = 1
+# Was 1 -- too permissive: a shared suffix of a single punctuation
+# character (e.g. two unrelated fragments that both happen to end in
+# ".") passed this check (len(".") == 1, and 1 < 1 is False), producing
+# a pattern like "^specific prefix.+.$" -- "ends in any character" isn't
+# a real constraint, so that suffix wasn't actually anchoring anything.
+# 4 is still a short suffix, but combined with the alnum check below it
+# forces at least a little real shared tail content, not just shared
+# trailing punctuation.
+MIN_SUFFIX_CHARS = 4
 
 
 def _load_candidates(output_dir):
@@ -722,13 +730,25 @@ def _common_suffix(strings):
     return _common_prefix([s[::-1] for s in strings])[::-1]
 
 
+def _has_real_content(s):
+    """True if s has at least one alphanumeric character, i.e. it isn't
+    made up entirely of punctuation/whitespace. A prefix or suffix that's
+    all punctuation (".", "...", "- ") isn't a real anchor -- it doesn't
+    distinguish this shape from countless unrelated fragments that
+    happen to share the same trailing punctuation, so trusting it as a
+    generalization signal (regardless of how the length threshold is
+    tuned) is the wrong kind of "enough in common"."""
+    return any(ch.isalnum() for ch in s)
+
+
 def _generalize_group(fragments):
     """Returns a suggested regex string for a group of 2+ same-shaped
     fragments, or None if there isn't enough in common to trust a
-    generalization (near-identical fragments with nothing to diff, or a
-    shared prefix/suffix too thin to be meaningful -- see module
-    docstring). Caller falls back to per-fragment literals in either
-    case."""
+    generalization (near-identical fragments with nothing to diff, a
+    shared prefix/suffix too thin to be meaningful, or a prefix/suffix
+    that's real-content-free -- see module docstring and
+    _has_real_content()). Caller falls back to per-fragment literals in
+    any of these cases."""
     if len(fragments) < 2:
         return None
 
@@ -738,10 +758,13 @@ def _generalize_group(fragments):
 
     if len(prefix) + len(suffix) >= shortest:
         return None  # fragments are identical or near-identical -- nothing to generalize
-    if len(prefix.strip()) < MIN_PREFIX_CHARS or len(suffix.strip()) < MIN_SUFFIX_CHARS:
+    prefix_stripped, suffix_stripped = prefix.strip(), suffix.strip()
+    if len(prefix_stripped) < MIN_PREFIX_CHARS or len(suffix_stripped) < MIN_SUFFIX_CHARS:
         return None
+    if not (_has_real_content(prefix_stripped) and _has_real_content(suffix_stripped)):
+        return None  # length alone isn't enough -- e.g. "...." clears a length floor but anchors nothing
 
-    return f"^{re.escape(prefix.strip())}.+{re.escape(suffix.strip())}$"
+    return f"^{re.escape(prefix_stripped)}.+{re.escape(suffix_stripped)}$"
 
 
 def _literal_pattern(fragment):
