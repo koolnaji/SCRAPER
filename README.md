@@ -344,7 +344,7 @@ If you start scraping a new language and articles keep landing in `unknown/`, ch
 
 \- Failed URLs get one automatic retry pass at the end of each run.
 
-\- `--lemmatize` loads its model once up front — a bad language code fails immediately with a clear error instead of failing silently on every article.
+\- `--lemmatize` loads its model up front for the requested language — a bad language code fails immediately with a clear error instead of failing silently on every article. Pipelines are cached per language code (not a single shared slot), so doing multiple runs back-to-back in the interactive menu with different `--lemmatize` languages loads a fresh model for each one instead of silently reusing whichever language loaded first.
 
 \- Progress is shown with a live `tqdm` bar (✅/💥 counts in the postfix); per-article status lines print above it without corrupting the bar.
 

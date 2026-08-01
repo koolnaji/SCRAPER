@@ -164,6 +164,48 @@ BOILERPLATE_PATTERNS = [
     # Auto-suggested from boilerplate_candidates.json review (2026-07-31) -- france24.com, error message, 1 example(s).
     # e.g. https://www.france24.com/fr/vid%C3%A9o/20260730-histoire-fontaines-wallace-embl%C3%A9matiques-d%C3%A9cor-parisien-paris-france-histoire-culture-prime
     '^Page\\ non\\ trouvée$',
+    # Auto-suggested from boilerplate_candidates.json review (2026-08-01) -- bbc.com, social-share prompt, 1 example(s).
+    # e.g. https://www.bbc.com/news/articles/c74gwvygkjdo
+    '^Follow\\ BBC\\ News\\ India\\ on\\ Instagram,\\ YouTube,\\ Twitter\\ and\\ Facebook\\.$',
+    # Auto-suggested from boilerplate_candidates.json review (2026-08-01) -- apnews.com, site access block / error page text, 1 example(s).
+    # e.g. https://apnews.com/article/savannah-nancy-guthrie-missing-mom-ransom-note-7a53c668597233ef4dbc82204118067f
+    '^The\\ owner\\ of\\ this\\ website\\ \\(apnews\\.com\\)\\ has\\ banned\\ you\\ temporarily\\ from\\ accessing\\ this\\ website\\.\\\nPlease\\ see\\ https://developers\\.cloudflare\\.com/support/troubleshooting/http\\-status\\-codes/cloudflare\\-1xxx\\-errors/error\\-1015/\\ for\\ more\\ details\\.\\\n\\ \\ \\ \\ \\ \\ \\ \\ Thank\\ you\\ for\\ your\\ feedback!$',
+    # Auto-suggested from boilerplate_candidates.json review (2026-08-01) -- apnews.com, promotional blurb for site feature, 1 example(s).
+    # e.g. https://apnews.com/article/news-quiz-july-31-fauci-trump-fifa-cracker-barrel-bts-berlin
+    '^It\\ was\\ a\\ busy\\ week\\ in\\ the\\ news\\ cycle\\.\\ Test\\ your\\ knowledge\\ of\\ the\\ biggest\\ stories\\ and\\ see\\ what\\ you\\ might\\ have\\ missed\\ in\\ The\\ Associated\\ Press’\\ weekly\\ news\\ quiz\\.$',
+    # Auto-suggested from boilerplate_candidates.json review (2026-08-01) -- theguardian.com, header navigation and newsletter subscription widget, 1 example(s).
+    # e.g. https://www.theguardian.com/world/2026/jul/30/sign-up-for-this-is-india-our-free-weekly-newsletter-on-life-in-the-subcontinent
+    "^The\\ Guardian\\\nThe\\ Guardian\\\nINT\\ Focused\\\nINT\\ Focused\\\nSign\\ up\\ for\\ This\\ is\\ India:\\ our\\ free\\ weekly\\ newsletter\\ on\\ life\\ in\\ the\\ subcontinent\\\nNiha\\ Masih’s\\ weekly\\ newsletter\\ about\\ the\\ stories,\\ ideas\\ and\\ news\\ makers\\ of\\ modern\\ India\\\nTell\\ your\\ friendsShare\\ \\\nYou'll\\ receive\\ this\\ newsletter\\ weekly$",
+    # Auto-suggested from boilerplate_candidates.json review (2026-08-01) -- theguardian.com, newsletter subscription prompt, 1 example(s).
+    # e.g. https://www.theguardian.com/commentisfree/2026/aug/01/biohacker-bryan-johnson-girlfriend-menstrual-blood
+    '^Sign\\ up\\ to\\ The\\ Week\\ in\\ Patriarchy\\\n\\\nGet\xa0Arwa\\ Mahdawi’s\xa0weekly\\ recap\\ of\\ the\\ most\\ important\\ stories\\ on\\ feminism\\ and\\ sexism\\ and\\ those\\ fighting\\ for\\ equality$',
+    # Auto-suggested from boilerplate_candidates.json review (2026-08-01) -- theguardian.com, layout structure label marker, 1 example(s).
+    # e.g. https://www.theguardian.com/commentisfree/2026/aug/01/biohacker-bryan-johnson-girlfriend-menstrual-blood
+    '^after\\ newsletter\\ promotion$',
+    # Auto-suggested from boilerplate_candidates.json review (2026-08-01) -- theguardian.com, image viewer UI element and photo credit, 1 example(s).
+    # e.g. https://www.theguardian.com/commentisfree/picture/2026/aug/01/christopher-harry-buying-suv-cartoon
+    '^View\\ image\\ in\\ fullscreen\\ Illustration:\\ Christopher\\ Harry/The\\ Guardian$',
+    # Auto-suggested from boilerplate_candidates.json review (2026-08-01) -- theguardian.com, topic tag list navigation, 1 example(s).
+    # e.g. https://www.theguardian.com/commentisfree/picture/2026/aug/01/christopher-harry-buying-suv-cartoon
+    '^Explore\\ more\\ on\\ these\\ topicsRoad\\ transportSaturday\\ Opinion\\ cartoonGreenhouse\\ gas\\ emissionsRoad\\ safetyMotoringAutomotive\\ emissionsAutomotive\\ industry$',
+    # Auto-suggested from boilerplate_candidates.json review (2026-08-01) -- theguardian.com, navigation link label, 1 example(s).
+    # e.g. https://www.theguardian.com/culture/2026/aug/01/from-ish-to-jared-leto-hollywoods-dark-secret-the-week-in-rave-reviews
+    '^Read\\ the\\ full\\ review$',
+    # Auto-suggested from boilerplate_candidates.json review (2026-08-01) -- theguardian.com, related-article link fragment, 1 example(s).
+    # e.g. https://www.theguardian.com/culture/2026/aug/01/from-ish-to-jared-leto-hollywoods-dark-secret-the-week-in-rave-reviews
+    '^Further\\ reading\\ ‘I\\ thought\\ it$',
+    # Auto-suggested from boilerplate_candidates.json review (2026-08-01) -- theguardian.com, submission callout prompt, 1 example(s).
+    # e.g. https://www.theguardian.com/lifeandstyle/2026/aug/01/blind-date-richard-katrina
+    '^Fancy\\ a\\ blind\\ date\\?\\ Email\\ blind\\.date@theguardian\\.com$',
+    # Auto-suggested from boilerplate_candidates.json review (2026-08-01) -- theguardian.com, form assistance link and terms of service footer, 1 example(s).
+    # e.g. https://www.theguardian.com/tv-and-radio/2026/jul/22/tell-us-your-favourite-happy-tv-show-ending
+    '^If\\ you’re\\ having\\ trouble\\ using\\ the\\ form\\ click\\ here\\.\\ Read\\ terms\\ of\\ service\\ here\\ and\\ privacy\\ policy\\ here\\.$',
+    # Auto-suggested from boilerplate_candidates.json review (2026-08-01) -- theguardian.com, newsletter privacy notice footer, 1 example(s).
+    # e.g. https://www.theguardian.com/global/2022/sep/20/sign-up-for-the-first-edition-newsletter-our-free-news-email
+    '^Privacy\\ Notice:\\ Newsletters\\ may\\ contain\\ information\\ about\\ charities,\\ online\\ ads,\\ and\\ content\\ funded\\ by\\ outside\\ parties\\.\\ If\\ you\\ do\\ not\\ have\\ an\\ account,\\ we\\ will\\ create\\ a\\ guest\\ account\\ for\\ you\\ on\\ theguardian\\.com\\ to\\ send\\ you\\ this\\ newsletter\\.\\ You\\ can\\ complete\\ full\\ registration\\ at\\ any\\ time\\.\\ For\\ more\\ information\\ about\\ how\\ we\\ use\\ your\\ data\\ see\\ our\\ Privacy\\ Policy\\.$',
+    # Auto-suggested from boilerplate_candidates.json review (2026-08-01) -- theguardian.com, newsletter subscription promotional block, 1 example(s).
+    # e.g. https://www.theguardian.com/info/2022/nov/14/football-daily-email-sign-up
+    "^The\\ Guardian\\\nThe\\ Guardian\\\nSign\\ up\\ for\\ the\\ Football\\ Daily\\ newsletter:\\ our\\ free\\ football\\ email\\\nKick\\ off\\ your\\ afternoon\\ with\\ the\\ Guardian’s\\ take\\ on\\ the\\ world\\ of\\ football\\\nTell\\ your\\ friends\\\nYou'll\\ receive\\ this\\ newsletter\\ every\\ weekday\\\nThe\\ Guardian\\\nThe\\ Guardian\\\nKick\\ off\\ your\\ afternoon\\ with\\ the\\ Guardian’s\\ take\\ on\\ the\\ world\\ of\\ football\\\nTell\\ your\\ friends\\\nYou'll\\ receive\\ this\\ newsletter\\ every\\ weekday$",
 ]
 
 # --------------------------------------------------------------------------

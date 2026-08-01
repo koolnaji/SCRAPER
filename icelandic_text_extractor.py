@@ -391,7 +391,7 @@ def get_site_override(url):
 # actually read from. Imported below from that module instead.
 
 
-_stanza_pipeline = None  # lazily initialized, only if --lemmatize is used
+_stanza_pipelines = {}  # lazily initialized per lang_code, only if --lemmatize is used
 
 
 # --------------------------------------------------------------------------
@@ -646,28 +646,43 @@ def delete_boilerplate_log(output_dir, skip_confirm=False):
 # --------------------------------------------------------------------------
 
 def ensure_lemmatizer(lang_code):
-    """Initialize the Stanza pipeline once, up front, before any scraping
-    happens. Previously this was lazy-loaded inside the per-article loop,
-    so a bad language code or a download failure would surface as a
-    generic 'Error' on article 1, get silently retried on every
-    subsequent article, and never give a clear top-level failure."""
-    global _stanza_pipeline
-    if _stanza_pipeline is not None:
+    """Initialize the Stanza pipeline for lang_code, up front, before any
+    scraping happens. Previously this was lazy-loaded inside the
+    per-article loop, so a bad language code or a download failure would
+    surface as a generic 'Error' on article 1, get silently retried on
+    every subsequent article, and never give a clear top-level failure.
+
+    BUGFIX: _stanza_pipeline used to be a single global keyed by
+    nothing -- ensure_lemmatizer() would no-op on any call after the
+    first, regardless of what lang_code it was actually asked for.
+    That's invisible within a single run (lang_code is fixed for the
+    whole run), but the wizard supports doing multiple runs back-to-back
+    in one process ("another run?"), and a second run with a different
+    --lemmatize language would silently keep lemmatizing with the
+    FIRST run's language/model instead of the one it was just told to
+    use -- e.g. English AP articles run through a cached Welsh
+    pipeline, producing garbled pseudo-Welsh text with no error or
+    warning, since Stanza has no way to know the input is the "wrong"
+    language -- it just does its best to lemmatize whatever text it's
+    given. Fixed by keying the cache off lang_code, so each language
+    gets (and keeps) its own pipeline instead of one shared slot."""
+    global _stanza_pipelines
+    if lang_code in _stanza_pipelines:
         return
     import stanza
     print(f"Loading Stanza lemmatizer for '{lang_code}'...")
     try:
-        _stanza_pipeline = stanza.Pipeline(lang_code, processors="tokenize,lemma")
+        _stanza_pipelines[lang_code] = stanza.Pipeline(lang_code, processors="tokenize,lemma")
     except Exception:
         print(f"Model for '{lang_code}' not found locally, downloading...")
         stanza.download(lang_code)
-        _stanza_pipeline = stanza.Pipeline(lang_code, processors="tokenize,lemma")
+        _stanza_pipelines[lang_code] = stanza.Pipeline(lang_code, processors="tokenize,lemma")
     print("Lemmatizer ready!\n")
 
 
 def lemmatize(text, lang_code):
     ensure_lemmatizer(lang_code)
-    doc = _stanza_pipeline(text)
+    doc = _stanza_pipelines[lang_code](text)
     lemmas = []
     for sentence in doc.sentences:
         for word in sentence.words:
