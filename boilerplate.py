@@ -960,13 +960,20 @@ def run_review(output_dir, patterns_module):
 
     promoted, skipped, quit_early = 0, 0, False
 
-    for (domain, reason), group in groups.items():
-        pattern_str, is_generalized = _build_suggestion(group)
-        if pattern_str is None:
-            print(f"\n⚠️  Couldn't build a safe pattern for {domain} / {reason!r} -- skipping, still in the log.")
-            continue
+    def review_one(domain, reason, candidates_for_this_pattern, pattern_str, is_generalized):
+        """Prints one Domain/Reason/Seen/Pattern block, prompts once, and
+        applies the result to EVERY candidate in candidates_for_this_pattern
+        (their shared fragment(s) all being covered by this one
+        pattern_str). Returns True if the user quit ('q'), False otherwise.
+        Mutates active_patterns/compiled_existing/promoted/skipped via
+        nonlocal -- kept as one shared function specifically so the
+        multi-fragment-group path below and the normal single-pattern
+        path go through the exact same review/insert/count logic, instead
+        of two copies that could silently diverge (same reasoning as
+        gemini_retry.py's module docstring)."""
+        nonlocal active_patterns, compiled_existing, promoted, skipped
 
-        examples = [c["fragment"] for c in group][:3]
+        examples = [c["fragment"] for c in candidates_for_this_pattern][:3]
         # 11 chars of leading indent + 2 quote marks accounts for the
         # "           \"...\"" wrapper below, so the fragment preview
         # itself still lands inside half_width() rather than the
@@ -975,37 +982,72 @@ def run_review(output_dir, patterns_module):
         print(f"\n{rule('-')}")
         print(f"Domain:  {domain}")
         print(f"Reason:  {reason}")
-        print(f"Seen:    {len(group)} example(s){' (generalized from these)' if is_generalized else ' (single example -- literal match only)'}")
+        print(f"Seen:    {len(candidates_for_this_pattern)} example(s)"
+              f"{' (generalized from these)' if is_generalized else ' (single example -- literal match only)'}")
         for ex in examples:
             print(f"           \"{ex[:max_ex_len]}{'...' if len(ex) > max_ex_len else ''}\"")
         print(f"Pattern: {pattern_str!r}")
 
         choice = _prompt("Add this to boilerplate_patterns.py?")
         if choice == "q":
-            quit_early = True
-            break
+            return True
 
-        for c in group:
+        for c in candidates_for_this_pattern:
             c["reviewed"] = True
         if choice == "y":
-            urls = sorted({c.get("url", "") for c in group if c.get("url")})
+            urls = sorted({c.get("url", "") for c in candidates_for_this_pattern if c.get("url")})
             comment_lines = [
                 f"# Auto-suggested from {CANDIDATES_FILENAME} review "
                 f"({datetime.now(timezone.utc).strftime('%Y-%m-%d')}) -- "
-                f"{domain}, {reason}, {len(group)} example(s)."
+                f"{domain}, {reason}, {len(candidates_for_this_pattern)} example(s)."
             ]
             if urls:
                 comment_lines.append(f"# e.g. {urls[0]}")
             _insert_pattern_into_file(patterns_module.__file__, pattern_str, comment_lines)
             active_patterns.append(pattern_str)
             compiled_existing = _compile_alternation(active_patterns)
-            for c in group:
+            for c in candidates_for_this_pattern:
                 c["promoted"] = True
             promoted += 1
             print("   ✅ Added.")
         else:
             skipped += 1
             print("   ↩️  Skipped (marked reviewed, won't be re-suggested).")
+        return False
+
+    for (domain, reason), group in groups.items():
+        pattern_str, is_generalized = _build_suggestion(group)
+        if pattern_str is not None:
+            quit_early = review_one(domain, reason, group, pattern_str, is_generalized)
+            if quit_early:
+                break
+            continue
+
+        # _build_suggestion() returned None -- the group's fragments
+        # genuinely don't share enough to generalize safely (e.g. a
+        # "related article" widget with a different headline every
+        # time, same shape as SVT's related-stories widget elsewhere in
+        # this file). This USED to just print a warning and skip the
+        # whole group permanently -- nothing in it ever got
+        # c["reviewed"] set, so it could never be promoted, skipped, OR
+        # discarded, and just re-appeared as "still unreviewed" on every
+        # future run with no way to resolve it. _build_suggestion()'s
+        # own docstring already said the caller should fall back to
+        # handling these one fragment at a time; this is that fallback,
+        # finally implemented -- each fragment gets its own literal
+        # pattern and its own review prompt, going through the exact
+        # same review_one() logic as a normal single-pattern group.
+        if len(group) > 1:
+            print(f"\n⚠️  {domain} / {reason!r}: {len(group)} examples didn't "
+                  f"generalize safely (too different from each other) -- "
+                  f"reviewing each individually instead.")
+        for c in group:
+            literal = _literal_pattern(c["fragment"].strip())
+            quit_early = review_one(domain, reason, [c], literal, False)
+            if quit_early:
+                break
+        if quit_early:
+            break
 
     _save_candidates(candidates, json_path)
 
